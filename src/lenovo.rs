@@ -32,6 +32,7 @@ use crate::{
     Boot, EnabledDisabled, PCIeDevice, PowerState, Redfish, RedfishError, Status, StatusInternal,
     SystemPowerControl,
 };
+use crate::EnabledDisabled::Enabled;
 
 pub struct Bmc {
     s: RedfishStandard,
@@ -54,6 +55,12 @@ impl Redfish for Bmc {
 
     fn bios(&self) -> Result<HashMap<String, serde_json::Value>, RedfishError> {
         self.s.bios()
+    }
+
+    fn machine_setup(&self) -> Result<(), RedfishError> {
+        self.setup_serial_console()?;
+        self.clear_tpm()?;
+        self.lockdown(Enabled)
     }
 
     fn lockdown(&self, target: EnabledDisabled) -> Result<(), RedfishError> {

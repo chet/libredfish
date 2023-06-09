@@ -67,6 +67,10 @@ impl Redfish for RedfishStandard {
         self.clear_pending_with_url(&url)
     }
 
+    fn machine_setup(&self) -> Result<(), RedfishError> {
+        unimplemented!("No standard implementation");
+    }
+
     fn lockdown(&self, _target: EnabledDisabled) -> Result<(), RedfishError> {
         unimplemented!("No standard implementation");
     }
