@@ -29,6 +29,7 @@
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
+    sync::Once,
     thread::sleep,
     time::Duration,
 };
@@ -41,6 +42,8 @@ const ROOT_DIR: &str = env!("CARGO_MANIFEST_DIR");
 const DELL_PORT: &str = "8733";
 const LENOVO_PORT: &str = "8734";
 const NVIDIA_PORT: &str = "8735";
+
+static SETUP_LOGGING: Once = Once::new();
 
 #[test]
 fn test_dell() -> Result<(), anyhow::Error> {
@@ -58,6 +61,25 @@ fn test_nvidia_dpu() -> Result<(), anyhow::Error> {
 }
 
 fn run_integration_test(vendor_dir: &'static str, port: &'static str) -> Result<(), anyhow::Error> {
+    SETUP_LOGGING.call_once(|| {
+        use tracing_subscriber::fmt::Layer;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::{filter::LevelFilter, EnvFilter};
+        tracing_subscriber::registry()
+            .with(
+                EnvFilter::builder()
+                    .with_default_directive(LevelFilter::INFO.into())
+                    .from_env_lossy(),
+            )
+            .with(
+                Layer::default()
+                    .compact()
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_ansi(false),
+            )
+            .init();
+    });
     let mut mockup_server = match MockupServer::new(vendor_dir, port) {
         Some(s) => s,
         None => {
@@ -92,12 +114,6 @@ fn run_integration_test(vendor_dir: &'static str, port: &'static str) -> Result<
         assert!(redfish.lockdown_status()?.is_fully_disabled());
     }
 
-    redfish.lockdown(libredfish::EnabledDisabled::Enabled)?;
-    redfish.power(libredfish::SystemPowerControl::GracefulRestart)?;
-    if vendor_dir == "lenovo" {
-        assert!(redfish.lockdown_status()?.is_fully_enabled());
-    }
-
     redfish.setup_serial_console()?;
     redfish.power(libredfish::SystemPowerControl::ForceRestart)?;
     assert!(redfish.serial_console_status()?.is_fully_enabled());
@@ -110,6 +126,12 @@ fn run_integration_test(vendor_dir: &'static str, port: &'static str) -> Result<
     redfish.boot_once(libredfish::Boot::Pxe)?;
     redfish.boot_first(libredfish::Boot::HardDisk)?;
     redfish.power(libredfish::SystemPowerControl::ForceRestart)?;
+
+    redfish.lockdown(libredfish::EnabledDisabled::Enabled)?;
+    redfish.power(libredfish::SystemPowerControl::GracefulRestart)?;
+    if vendor_dir == "lenovo" {
+        assert!(redfish.lockdown_status()?.is_fully_enabled());
+    }
 
     Ok(())
 }
