@@ -24,6 +24,9 @@ use std::collections::HashMap;
 
 use crate::model::boot::{BootSourceOverrideEnabled, BootSourceOverrideTarget};
 use crate::model::oem::nvidia::{HostPrivilegeLevel, InternalCPUModel};
+use crate::model::service_root::ServiceRoot;
+use crate::model::{ComputerSystem, Manager};
+use crate::RoleId;
 use crate::{
     model::BootOption, standard::RedfishStandard, NetworkDeviceFunction,
     NetworkDeviceFunctionCollection, Redfish, RedfishError,
@@ -55,6 +58,15 @@ impl Bmc {
 }
 
 impl Redfish for Bmc {
+    fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        role_id: RoleId,
+    ) -> Result<(), RedfishError> {
+        self.s.create_user(username, password, role_id)
+    }
+
     fn change_password(&self, user: &str, new: &str) -> Result<(), RedfishError> {
         self.s.change_password(user, new)
     }
@@ -182,7 +194,7 @@ impl Redfish for Bmc {
         self.s.clear_pending()
     }
 
-    fn get_system(&self) -> Result<crate::model::ComputerSystem, RedfishError> {
+    fn get_system(&self) -> Result<ComputerSystem, RedfishError> {
         self.s.get_system()
     }
 
@@ -291,6 +303,26 @@ impl Redfish for Bmc {
         )]);
         let url = format!("Systems/{}/Bios/Settings", self.s.system_id());
         self.s.client.patch(&url, data).map(|_status_code| Ok(()))?
+    }
+
+    fn get_service_root(&self) -> Result<ServiceRoot, RedfishError> {
+        self.s.get_service_root()
+    }
+
+    fn get_systems(&self) -> Result<Vec<String>, RedfishError> {
+        self.s.get_systems()
+    }
+
+    fn get_managers(&self) -> Result<Vec<String>, RedfishError> {
+        self.s.get_managers()
+    }
+
+    fn get_manager(&self) -> Result<Manager, RedfishError> {
+        self.s.get_manager()
+    }
+
+    fn bmc_reset_to_defaults(&self) -> Result<(), RedfishError> {
+        self.s.bmc_reset_to_defaults()
     }
 }
 

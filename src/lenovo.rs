@@ -25,7 +25,10 @@ use std::{collections::HashMap, time::Duration};
 use reqwest::Method;
 use tracing::debug;
 
+use crate::RoleId;
 use crate::model::oem::nvidia::{HostPrivilegeLevel, InternalCPUModel};
+use crate::model::service_root::ServiceRoot;
+use crate::model::Manager;
 use crate::model::{secure_boot::SecureBoot, ComputerSystem};
 use crate::EnabledDisabled::Enabled;
 use crate::{
@@ -55,6 +58,15 @@ impl Bmc {
 }
 
 impl Redfish for Bmc {
+    fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        role_id: RoleId,
+    ) -> Result<(), RedfishError> {
+        self.s.create_user(username, password, role_id)
+    }
+
     fn change_password(&self, user: &str, new: &str) -> Result<(), RedfishError> {
         self.s.change_password(user, new)
     }
@@ -384,6 +396,26 @@ impl Redfish for Bmc {
 
     fn set_host_privilege_level(&self, level: HostPrivilegeLevel) -> Result<(), RedfishError> {
         self.s.set_host_privilege_level(level)
+    }
+
+    fn get_service_root(&self) -> Result<ServiceRoot, RedfishError> {
+        self.s.get_service_root()
+    }
+
+    fn get_systems(&self) -> Result<Vec<String>, RedfishError> {
+        self.s.get_systems()
+    }
+
+    fn get_managers(&self) -> Result<Vec<String>, RedfishError> {
+        self.s.get_managers()
+    }
+
+    fn get_manager(&self) -> Result<Manager, RedfishError> {
+        self.s.get_manager()
+    }
+
+    fn bmc_reset_to_defaults(&self) -> Result<(), RedfishError> {
+        self.s.bmc_reset_to_defaults()
     }
 }
 

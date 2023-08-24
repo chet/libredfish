@@ -32,16 +32,17 @@ use crate::{
         },
         power::Power,
         secure_boot::SecureBoot,
+        service_root::ServiceRoot,
         software_inventory::{SoftwareInventory, SoftwareInventoryCollection},
         network_device_function::{NetworkDeviceFunction, NetworkDeviceFunctionCollection}, 
         chassis::{Chassis, ChassisCollection},
         power::Power,
         thermal::Thermal,
-        BootOption, ComputerSystem, OnOff,
+        BootOption, ComputerSystem, Manager, OnOff,
     },
     standard::RedfishStandard,
     Boot, BootOptions, EnabledDisabled, PCIeDevice, PowerState, Redfish, RedfishError, Status,
-    StatusInternal, SystemPowerControl,
+    StatusInternal, SystemPowerControl, RoleId,
 };
 
 pub struct Bmc {
@@ -55,6 +56,15 @@ impl Bmc {
 }
 
 impl Redfish for Bmc {
+    fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        role_id: RoleId,
+    ) -> Result<(), RedfishError> {
+        self.s.create_user(username, password, role_id)
+    }
+
     fn change_password(&self, user: &str, new: &str) -> Result<(), RedfishError> {
         self.s.change_password(user, new)
     }
@@ -407,6 +417,26 @@ impl Redfish for Bmc {
 
     fn set_host_privilege_level(&self, level: HostPrivilegeLevel) -> Result<(), RedfishError> {
         self.s.set_host_privilege_level(level)
+    }
+
+    fn get_service_root(&self) -> Result<ServiceRoot, RedfishError> {
+        self.s.get_service_root()
+    }
+
+    fn get_systems(&self) -> Result<Vec<String>, RedfishError> {
+        self.s.get_systems()
+    }
+
+    fn get_managers(&self) -> Result<Vec<String>, RedfishError> {
+        self.s.get_managers()
+    }
+
+    fn get_manager(&self) -> Result<Manager, RedfishError> {
+        self.s.get_manager()
+    }
+
+    fn bmc_reset_to_defaults(&self) -> Result<(), RedfishError> {
+        self.s.bmc_reset_to_defaults()
     }
 }
 

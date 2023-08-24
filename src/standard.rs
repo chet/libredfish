@@ -28,22 +28,21 @@ use crate::model::chassis::{Chassis, ChassisCollection};
 use crate::model::oem::nvidia::{HostPrivilegeLevel, InternalCPUModel};
 use crate::model::power::Power;
 use crate::model::secure_boot::SecureBoot;
-use crate::model::power::Power;
 use crate::model::software_inventory::{SoftwareInventory, SoftwareInventoryCollection};
 use crate::model::thermal::Thermal;
-use crate::model::{power, storage, thermal};
-use crate::model::thermal::Thermal;
 use crate::model::{power, storage, thermal, BootOption};
+use crate::model::service_root::ServiceRoot;
 use crate::network::{RedfishHttpClient, REDFISH_ENDPOINT};
 use crate::{
     model, Boot, EnabledDisabled, NetworkDeviceFunction, NetworkDeviceFunctionCollection,
-    NetworkPort, NetworkPortCollection, PowerState, Redfish, Status,
+    NetworkPort, NetworkPortCollection, PowerState, Redfish, RoleId, Status, Systems,
 };
 use crate::{BootOptions, PCIeDevice, RedfishError};
 use crate::model::network_device_function::{NetworkDeviceFunction, NetworkDeviceFunctionCollection};
 use crate::model::chassis::{Chassis, ChassisCollection};
 
 /// The calls that use the Redfish standard without any OEM extensions.
+#[derive(Clone)]
 pub struct RedfishStandard {
     pub client: RedfishHttpClient,
     pub vendor: Option<String>,
@@ -52,6 +51,21 @@ pub struct RedfishStandard {
 }
 
 impl Redfish for RedfishStandard {
+    fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        role_id: RoleId,
+    ) -> Result<(), RedfishError> {
+        let mut data = HashMap::new();
+        data.insert("UserName", username.to_string());
+        data.insert("Password", password.to_string());
+        data.insert("RoleId", format!("{}", role_id).to_string());
+        self.client
+            .post("AccountService/Accounts", data)
+            .map(|_status_code| Ok(()))?
+    }
+
     fn change_password(&self, user: &str, new: &str) -> Result<(), RedfishError> {
         let url = format!("AccountService/Accounts/{}", user);
         let mut data = HashMap::new();
@@ -343,6 +357,55 @@ impl Redfish for RedfishStandard {
             "set_host_privilege_level".to_string(),
         ))
     }
+
+    fn get_service_root(&self) -> Result<ServiceRoot, RedfishError> {
+        let (_status_code, body) = self.client.get("")?;
+        Ok(body)
+    }
+
+    fn get_systems(&self) -> Result<Vec<String>, RedfishError> {
+        let (_, systems): (_, Systems) = self.client.get("Systems/")?;
+        if systems.members.is_empty() {
+            return Ok(vec!["1".to_string()]); // default to DMTF standard suggested
+        }
+        let v: Vec<String> = systems
+            .members
+            .into_iter()
+            .map(|d| d.odata_id.split('/').last().unwrap().to_string())
+            .collect();
+
+        Ok(v)
+    }
+
+    fn get_manager(&self) -> Result<Manager, RedfishError> {
+        let (_, manager): (_, Manager) = self
+            .client
+            .get(&format!("Managers/{}", self.manager_id()))?;
+        Ok(manager)
+    }
+
+    fn get_managers(&self) -> Result<Vec<String>, RedfishError> {
+        let (_, bmcs): (_, Managers) = self.client.get("Managers/")?;
+        if bmcs.members.is_empty() {
+            return Ok(vec!["1".to_string()]);
+        }
+        let v: Vec<String> = bmcs
+            .members
+            .into_iter()
+            .map(|d| d.odata_id.split('/').last().unwrap().to_string())
+            .collect();
+        Ok(v)
+    }
+
+    fn bmc_reset_to_defaults(&self) -> Result<(), RedfishError> {
+        let url = format!(
+            "Managers/{}/Actions/Manager.ResetToDefaults",
+            self.manager_id
+        );
+        let mut arg = HashMap::new();
+        arg.insert("ResetToDefaultsType", "ResetAll".to_string());
+        self.client.post(&url, arg).map(|_status_code| Ok(()))?
+    }
 }
 
 impl RedfishStandard {
@@ -350,18 +413,41 @@ impl RedfishStandard {
     // PUBLIC
     //
 
+    /// Fetch root URL and record the vendor, if any
+    pub fn set_vendor(&mut self, vendor_id: &str) -> Result<Box<dyn crate::Redfish>, RedfishError> {
+        self.vendor = Some(vendor_id.to_string());
+        debug!(
+            "BMC Vendor: {}",
+            self.vendor.as_deref().unwrap_or("Unknown")
+        );
+        match self.vendor.as_deref() {
+            Some("Dell") => Ok(Box::new(crate::dell::Bmc::new(self.clone())?)),
+            Some("Lenovo") => Ok(Box::new(crate::lenovo::Bmc::new(self.clone())?)),
+            Some("Nvidia") => Ok(Box::new(crate::nvidia::Bmc::new(self.clone())?)),
+            _ => Ok(Box::new(self.clone())),
+        }
+    }
+
+    /// Fetch and set System number. Needed for all `Systems/{system_id}/...` calls
+    pub fn set_system_id(&mut self, system_id: &str) -> Result<(), RedfishError> {
+        self.system_id = system_id.to_string();
+        Ok(())
+    }
+
+    /// Fetch and set Manager number. Needed for all `Managers/{system_id}/...` calls
+    pub fn set_manager_id(&mut self, manager_id: &str) -> Result<(), RedfishError> {
+        self.manager_id = manager_id.to_string();
+        Ok(())
+    }
+
     /// Create and setup a connection to BMC.
-    /// Issues two HTTP calls to get intial data.
     pub fn new(client: RedfishHttpClient) -> Result<Self, RedfishError> {
-        let mut r = Self {
+        let r = Self {
             client,
             manager_id: "".to_string(),
             system_id: "".to_string(),
             vendor: None,
         };
-        r.set_vendor()?;
-        r.set_system_id()?;
-        r.set_manager_id()?;
         Ok(r)
     }
 
@@ -444,56 +530,6 @@ impl RedfishStandard {
             }
         };
         Ok(core::mem::take(attrs_map))
-    }
-
-    /// Fetch root URL and record the vendor, if any
-    fn set_vendor(&mut self) -> Result<(), RedfishError> {
-        let (_, out): (_, HashMap<String, serde_json::Value>) = self.client.get("")?;
-        self.vendor = match out.get("Vendor") {
-            Some(v) => v.as_str().map(|s| s.to_string()),
-            None => None,
-        };
-        debug!(
-            "BMC Vendor: {}",
-            self.vendor.as_deref().unwrap_or("Unknown")
-        );
-        Ok(())
-    }
-
-    /// Fetch and set System number. Needed for all `Systems/{system_id}/...` calls
-    fn set_system_id(&mut self) -> Result<(), RedfishError> {
-        let (_, systems): (_, model::Systems) = self.client.get("Systems/")?;
-        if systems.members.is_empty() {
-            self.system_id = "1".to_string(); // default to DMTF standard suggested
-            return Ok(());
-        }
-        let v: Vec<&str> = systems.members[0].odata_id.split('/').collect();
-        self.system_id = v.last().unwrap().to_string();
-        Ok(())
-    }
-
-    /// Fetch and set Manager number. Needed for all `Managers/{system_id}/...` calls
-    fn set_manager_id(&mut self) -> Result<(), RedfishError> {
-        let (_, bmcs): (_, model::Managers) = self.client.get("Managers/")?;
-        if bmcs.members.is_empty() {
-            self.manager_id = "1".to_string(); // default to dmtf standard suggested
-            return Ok(());
-        }
-        let v: Vec<&str> = bmcs.members[0].odata_id.split('/').collect();
-        self.manager_id = v.last().unwrap().to_string();
-        Ok(())
-    }
-
-    //
-    // NOT CURRENTLY USED
-    //
-
-    #[allow(dead_code)]
-    pub fn get_manager(&self) -> Result<model::Manager, RedfishError> {
-        let (_, manager): (_, model::Manager) = self
-            .client
-            .get(&format!("Managers/{}", self.manager_id()))?;
-        Ok(manager)
     }
 
     #[allow(dead_code)]
