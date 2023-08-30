@@ -34,8 +34,8 @@ use crate::model::{power, storage, thermal, BootOption};
 use crate::model::service_root::ServiceRoot;
 use crate::network::{RedfishHttpClient, REDFISH_ENDPOINT};
 use crate::{
-    model, Boot, EnabledDisabled, NetworkDeviceFunction, NetworkDeviceFunctionCollection,
-    NetworkPort, NetworkPortCollection, PowerState, Redfish, RoleId, Status, Systems,
+    model, Boot, EnabledDisabled, NetworkDeviceFunction,
+    NetworkPort, PowerState, Redfish, RoleId, Status, Systems, EthernetInterfaceCollection,
 };
 use crate::{BootOptions, PCIeDevice, RedfishError};
 use crate::model::network_device_function::{NetworkDeviceFunction, NetworkDeviceFunctionCollection};
@@ -256,10 +256,17 @@ impl Redfish for RedfishStandard {
         Ok(body)
     }
 
-    fn get_chassises(&self) -> Result<ChassisCollection, RedfishError> {
-        let url = "Chassis".to_string();
-        let (_status_code, body) = self.client.get(&url)?;
-        Ok(body)
+    fn get_chassises(&self) -> Result<Vec<String>, RedfishError> {
+        let (_status_code, chassises): (_, ChassisCollection) = self.client.get("Chassis/")?;
+        if chassises.members.is_empty() {
+            return Ok(vec![]);
+        }
+        let v: Vec<String> = chassises
+            .members
+            .into_iter()
+            .map(|d| d.odata_id.split('/').last().unwrap().to_string())
+            .collect();
+        Ok(v)
     }
 
     fn get_chassis(&self, id: &str) -> Result<Chassis, RedfishError> {
@@ -268,10 +275,20 @@ impl Redfish for RedfishStandard {
         Ok(body)
     }
 
-    fn get_ethernet_interfaces(&self) -> Result<crate::EthernetInterfaceCollection, RedfishError> {
-        let url = format!("Managers/{}/EthernetInterfaces", self.manager_id());
-        let (_status_code, body) = self.client.get(&url)?;
-        Ok(body)
+    fn get_ethernet_interfaces(&self) -> Result<Vec<String>, RedfishError> {
+        let url = format!("Managers/{}/EthernetInterfaces", self.manager_id);
+        let (_status_code, eth_ifaces): (_, EthernetInterfaceCollection)  = self.client.get(&url)?;
+
+        if eth_ifaces.members.is_empty() {
+            return Ok(vec![]);
+        }
+        let v: Vec<String> = eth_ifaces
+            .members
+            .into_iter()
+            .map(|d| d.odata_id.split('/').last().unwrap().to_string())
+            .collect();
+
+        Ok(v)
     }
 
     fn get_ethernet_interface(&self, id: &str) -> Result<crate::EthernetInterface, RedfishError> {
@@ -280,9 +297,19 @@ impl Redfish for RedfishStandard {
         Ok(body)
     }
 
-    fn get_software_inventories(&self) -> Result<SoftwareInventoryCollection, RedfishError> {
-        let (_status_code, body) = self.client.get("UpdateService/FirmwareInventory")?;
-        Ok(body)
+    fn get_software_inventories(&self) -> Result<Vec<String>, RedfishError> {
+        let (_status_code, sw_inventories): (_, SoftwareInventoryCollection) = self.client.get("UpdateService/FirmwareInventory")?;
+
+        if sw_inventories.members.is_empty() {
+            return Ok(vec![]);
+        }
+        let v: Vec<String> = sw_inventories
+            .members
+            .into_iter()
+            .map(|d| d.odata_id.split('/').last().unwrap().to_string())
+            .collect();
+
+        Ok(v)
     }
 
     fn get_system(&self) -> Result<model::ComputerSystem, RedfishError> {
@@ -308,7 +335,7 @@ impl Redfish for RedfishStandard {
     fn get_network_device_functions(
         &self,
         _chassis_id: &str,
-    ) -> Result<NetworkDeviceFunctionCollection, RedfishError> {
+    ) -> Result<Vec<String>, RedfishError> {
         Err(RedfishError::NotSupported(
             "get_network_device_functions".to_string(),
         ))
@@ -324,7 +351,7 @@ impl Redfish for RedfishStandard {
         ))
     }
 
-    fn get_ports(&self, _chassis_id: &str) -> Result<NetworkPortCollection, RedfishError> {
+    fn get_ports(&self, _chassis_id: &str) -> Result<Vec<String>, RedfishError> {
         Err(RedfishError::NotSupported("get_ports".to_string()))
     }
 

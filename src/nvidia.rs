@@ -31,6 +31,7 @@ use crate::{
     model::BootOption, standard::RedfishStandard, NetworkDeviceFunction,
     NetworkDeviceFunctionCollection, Redfish, RedfishError,
 };
+use crate::model::port::NetworkPortCollection;
 
 pub struct Bmc {
     s: RedfishStandard,
@@ -80,7 +81,7 @@ impl Redfish for Bmc {
 
     fn get_software_inventories(
         &self,
-    ) -> Result<crate::model::software_inventory::SoftwareInventoryCollection, RedfishError> {
+    ) -> Result<Vec<String>, RedfishError> {
         self.s.get_software_inventories()
     }
 
@@ -206,7 +207,7 @@ impl Redfish for Bmc {
         self.s.disable_secure_boot()
     }
 
-    fn get_chassises(&self) -> Result<crate::ChassisCollection, RedfishError> {
+    fn get_chassises(&self) -> Result<Vec<String>, RedfishError> {
         self.s.get_chassises()
     }
 
@@ -214,7 +215,7 @@ impl Redfish for Bmc {
         self.s.get_chassis(id)
     }
 
-    fn get_ethernet_interfaces(&self) -> Result<crate::EthernetInterfaceCollection, RedfishError> {
+    fn get_ethernet_interfaces(&self) -> Result<Vec<String>, RedfishError> {
         self.s.get_ethernet_interfaces()
     }
 
@@ -222,13 +223,23 @@ impl Redfish for Bmc {
         self.s.get_ethernet_interface(id)
     }
 
-    fn get_ports(&self, chassis_id: &str) -> Result<crate::NetworkPortCollection, RedfishError> {
+    fn get_ports(&self, chassis_id: &str) -> Result<Vec<String>, RedfishError> {
         let url = format!(
             "Chassis/{}/NetworkAdapters/NvidiaNetworkAdapter/Ports",
             chassis_id
         );
-        let (_status_code, body) = self.s.client.get(&url)?;
-        Ok(body)
+        let (_status_code, body): (_, NetworkPortCollection)  = self.s.client.get(&url)?;
+
+        if body.members.is_empty() {
+            return Ok(vec![]);
+        }
+        let v: Vec<String> = body
+            .members
+            .into_iter()
+            .map(|d| d.odata_id.split('/').last().unwrap().to_string())
+            .collect();
+
+        Ok(v)
     }
 
     fn get_port(&self, chassis_id: &str, id: &str) -> Result<crate::NetworkPort, RedfishError> {
@@ -253,16 +264,21 @@ impl Redfish for Bmc {
         Ok(body)
     }
 
-    fn get_network_device_functions(
-        &self,
-        chassis_id: &str,
-    ) -> Result<NetworkDeviceFunctionCollection, RedfishError> {
+    fn get_network_device_functions(&self, chassis_id: &str,) -> Result<Vec<String>, RedfishError> {
         let url = format!(
             "Chassis/{}/NetworkAdapters/NvidiaNetworkAdapter/NetworkDeviceFunctions",
             chassis_id
         );
-        let (_status_code, body) = self.s.client.get(&url)?;
-        Ok(body)
+        let (_status_code, netdev_funcs): (_, NetworkDeviceFunctionCollection) = self.s.client.get(&url)?;
+        if netdev_funcs.members.is_empty() {
+            return Ok(vec![]);
+        }
+        let v: Vec<String> = netdev_funcs
+            .members
+            .into_iter()
+            .map(|d| d.odata_id.split('/').last().unwrap().to_string())
+            .collect();
+        Ok(v)
     }
 
     fn change_uefi_password(
