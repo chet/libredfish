@@ -32,12 +32,11 @@ pub enum RedfishError {
     #[error("Non-2XX HTTP status at {url}. {source}")]
     HTTPError { url: String, source: reqwest::Error },
 
-    #[error(
-        "HTTP {status_code} at {url}. Enable debug logs with `export RUST_LOG=debug` and re-run."
-    )]
+    #[error("HTTP {status_code} at {url}: {response_body}")]
     HTTPErrorCode {
         url: String,
         status_code: StatusCode,
+        response_body: String,
     },
 
     #[error("Could not deserialize response from {url}. Body: {body}. {source}")]
@@ -85,4 +84,7 @@ pub enum RedfishError {
 
     #[error("BMC vendor does not support this operation: {0}")]
     NotSupported(String),
+
+    #[error("Could not find user with UserName matching '{0}'")]
+    UserNotFound(String),
 }

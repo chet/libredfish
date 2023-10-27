@@ -26,6 +26,7 @@ pub mod dell;
 pub mod hp;
 pub mod lenovo;
 pub mod nvidia;
+pub mod supermicro;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]

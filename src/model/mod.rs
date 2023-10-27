@@ -3,6 +3,7 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 pub mod manager;
 pub use manager::*;
+pub mod serial_interface;
 
 pub mod system;
 pub use system::*;
@@ -14,7 +15,7 @@ pub use bios::*;
 pub mod oem;
 pub mod secure_boot;
 
-// power/thermal/storage not currently used
+pub mod account_service;
 pub mod chassis;
 pub mod ethernet_interface;
 pub mod network_device_function;
@@ -149,8 +150,51 @@ impl FromStr for EnabledDisabled {
     }
 }
 
+impl From<EnabledDisabled> for serde_json::Value {
+    fn from(val: EnabledDisabled) -> Self {
+        serde_json::Value::String(val.to_string())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
+pub enum EnableDisable {
+    Enable,
+    Disable,
+}
+
+impl EnableDisable {
+    pub fn is_enabled(self) -> bool {
+        self == EnableDisable::Enable
+    }
+}
+
+impl fmt::Display for EnableDisable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+impl FromStr for EnableDisable {
+    type Err = InvalidValueError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Enable" => Ok(Self::Enable),
+            "Disable" => Ok(Self::Disable),
+            x => Err(InvalidValueError(format!(
+                "Invalid EnableDisable value: {x}"
+            ))),
+        }
+    }
+}
+
+impl From<EnableDisable> for serde_json::Value {
+    fn from(val: EnableDisable) -> Self {
+        serde_json::Value::String(val.to_string())
+    }
+}
+
 #[derive(Debug)]
-pub struct InvalidValueError(String);
+pub struct InvalidValueError(pub String);
 
 impl std::error::Error for InvalidValueError {}
 
@@ -184,7 +228,6 @@ impl fmt::Display for LinkStatus {
         fmt::Debug::fmt(self, f)
     }
 }
-
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FirmwareCurrent {

@@ -128,7 +128,7 @@ pub struct ComputerSystem {
     #[serde(default)]
     pub trusted_modules: Vec<TrustedModule>,
     #[serde(default, rename = "PCIeDevices")]
-    pub pcie_devices: Vec<ODataId>,
+    pub pcie_devices: Vec<ODataId>, // not in Supermicro
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -136,7 +136,7 @@ pub struct ComputerSystem {
 pub struct BootOptions {
     #[serde(flatten)]
     pub odata: ODataLinks,
-    pub description: String,
+    pub description: Option<String>,
     pub members: Vec<ODataId>,
     pub name: String,
 }
@@ -152,7 +152,7 @@ pub struct BootOption {
     pub display_name: String,
     pub id: String,
     pub name: String,
-    pub uefi_device_path: String,
+    pub uefi_device_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -162,6 +162,8 @@ pub struct PCIeDevice {
     pub firmware_version: Option<String>,
     pub id: Option<String>,
     pub manufacturer: Option<String>,
+    #[serde(rename = "GPUVendor")]
+    pub gpu_vendor: Option<String>,
     pub name: Option<String>,
     pub part_number: Option<String>,
     pub serial_number: Option<String>,
