@@ -53,9 +53,10 @@ impl fmt::Display for SystemPowerControl {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum PowerState {
     Off,
+    #[default]
     On,
     PoweringOff,
     PoweringOn,
@@ -108,13 +109,14 @@ pub struct TrustedModule {
     pub status: StatusState,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Default, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct ComputerSystem {
     pub asset_tag: Option<String>,
     pub boot: Boot,
     pub bios_version: Option<String>,
     pub ethernet_interfaces: Option<ODataId>,
+    pub id: String,
     pub manufacturer: Option<String>,
     pub model: Option<String>,
     pub oem: Option<SystemExtensions>,
