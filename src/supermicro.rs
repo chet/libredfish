@@ -39,7 +39,7 @@ use crate::{
         BootOption, ComputerSystem, EnableDisable, InvalidValueError, Manager,
     },
     standard::RedfishStandard,
-    Boot, BootOptions, EnabledDisabled, MachineSetupDiff, MachineSetupStatus, PCIeDevice, PowerState,
+    Boot, BootOptions, EnabledDisabled, MachineSetupDiff, MachineSetupStatus, JobState, PCIeDevice, PowerState,
     Redfish, RedfishError, RoleId, Status, StatusInternal, SystemPowerControl,
 };
 
@@ -503,7 +503,7 @@ impl Redfish for Bmc {
         &self,
         current_uefi_password: &str,
         new_uefi_password: &str,
-    ) -> Result<(), RedfishError> {
+    ) -> Result<Option<String>, RedfishError> {
         self.s
             .change_uefi_password(current_uefi_password, new_uefi_password)
             .await
@@ -533,6 +533,10 @@ impl Redfish for Bmc {
 
     async fn bmc_reset_to_defaults(&self) -> Result<(), RedfishError> {
         self.s.bmc_reset_to_defaults().await
+    }
+
+    async fn get_job_state(&self, job_id: &str) -> Result<JobState, RedfishError> {
+        self.s.get_job_state(job_id).await
     }
 }
 

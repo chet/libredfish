@@ -251,7 +251,9 @@ pub trait Redfish: Send + Sync + 'static {
         &self,
         current_uefi_password: &str,
         new_uefi_password: &str,
-    ) -> Result<(), RedfishError>;
+    ) -> Result<Option<String>, RedfishError>;
+
+    async fn get_job_state(&self, job_id: &str) -> Result<JobState, RedfishError>;
 }
 
 // When Carbide drops it's `IpmiCommand.launch_command` background job system, we can
@@ -373,5 +375,27 @@ impl fmt::Display for MachineSetupDiff {
             "{} is '{}' expected '{}'",
             self.key, self.actual, self.expected
         )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")] // No tag requried - this is not nested
+pub enum JobState {
+    Scheduled,
+    Running,
+    Completed,
+    CompletedWithErrors,
+    Unknown,
+}
+
+impl JobState {
+    fn from_str(s: &str) -> JobState {
+        match s {
+            "Scheduled" => JobState::Scheduled,
+            "Running" => JobState::Running,
+            "Completed" => JobState::Completed,
+            "CompletedWithErrors" => JobState::CompletedWithErrors,
+            _ => JobState::Unknown,
+        }
     }
 }

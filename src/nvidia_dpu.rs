@@ -41,7 +41,7 @@ use crate::{
     standard::RedfishStandard,
     NetworkDeviceFunction, Redfish, RedfishError,
 };
-use crate::{MachineSetupDiff, MachineSetupStatus, RoleId};
+use crate::{MachineSetupDiff, MachineSetupStatus, JobState, RoleId};
 
 pub struct Bmc {
     s: RedfishStandard,
@@ -440,7 +440,7 @@ impl Redfish for Bmc {
         &self,
         current_uefi_password: &str,
         new_uefi_password: &str,
-    ) -> Result<(), RedfishError> {
+    ) -> Result<Option<String>, RedfishError> {
         let mut attributes = HashMap::new();
         let mut data = HashMap::new();
         data.insert("CurrentUefiPassword", current_uefi_password.to_string());
@@ -448,7 +448,7 @@ impl Redfish for Bmc {
         attributes.insert("Attributes", data);
         let url = format!("Systems/{}/Bios/Settings", self.s.system_id());
         let _status_code = self.s.client.patch(&url, attributes).await?;
-        Ok(())
+        Ok(None)
     }
 
     async fn change_boot_order(&self, boot_array: Vec<String>) -> Result<(), RedfishError> {
@@ -476,6 +476,10 @@ impl Redfish for Bmc {
 
     async fn bmc_reset_to_defaults(&self) -> Result<(), RedfishError> {
         self.s.bmc_reset_to_defaults().await
+    }
+
+    async fn get_job_state(&self, job_id: &str) -> Result<JobState, RedfishError> {
+        self.s.get_job_state(job_id).await
     }
 }
 
