@@ -202,6 +202,7 @@ pub trait Redfish: Send + Sync + 'static {
         &self,
         chassis_id: &str,
         id: &str,
+        port: Option<&str>,
     ) -> Result<NetworkDeviceFunction, RedfishError>;
 
     // List all Chassises
