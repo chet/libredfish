@@ -653,14 +653,7 @@ impl Redfish for RedfishStandard {
         transfer_protocol: TransferProtocolType,
     ) -> Result<Task, RedfishError> {
         let data: HashMap<String, serde_json::Value> = HashMap::from([
-            (
-                "ImageURI".to_string(),
-                serde_json::from_str(image_uri).map_err(|e| RedfishError::JsonSerializeError {
-                    url: "UpdateService/Actions/UpdateService.SimpleUpdate".to_string(),
-                    object_debug: "ImageURI".to_string(),
-                    source: e,
-                })?,
-            ),
+            ("ImageURI".to_string(), json!(image_uri)),
             ("TransferProtocol".to_string(), json!(transfer_protocol)),
             ("Targets".to_string(), json!(targets)),
         ]);
@@ -680,6 +673,10 @@ impl Redfish for RedfishStandard {
             Some(response_body) => Ok(response_body),
             None => Err(RedfishError::NoContent),
         }
+    }
+
+    async fn enable_rshim_bmc(&self) -> Result<(), RedfishError> {
+        Err(RedfishError::NotSupported("enable_rshim_bmc".to_string()))
     }
 }
 
