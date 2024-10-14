@@ -370,6 +370,9 @@ pub trait Redfish: Send + Sync + 'static {
     async fn enable_ipmi_over_lan(&self, target: EnabledDisabled) -> Result<(), RedfishError>;
 
     async fn enable_rshim_bmc(&self) -> Result<(), RedfishError>;
+
+    // Only applicable to Vikings
+    async fn clear_nvram(&self) -> Result<(), RedfishError>;
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
