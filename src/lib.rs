@@ -1,22 +1,43 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
 use std::{collections::HashMap, fmt, path::Path, time::Duration};
 
 pub mod model;
 use model::account_service::ManagerAccount;
-pub use model::chassis::{Chassis, NetworkAdapter};
+pub use model::chassis::{Assembly, Chassis, NetworkAdapter};
 pub use model::ethernet_interface::EthernetInterface;
 pub use model::network_device_function::NetworkDeviceFunction;
-use model::oem::nvidia_dpu::{HostPrivilegeLevel, InternalCPUModel};
+use model::oem::nvidia_dpu::{HostPrivilegeLevel, InternalCPUModel, NicMode};
 pub use model::port::NetworkPort;
 pub use model::resource::{Collection, OData, Resource};
 use model::sensor::GPUSensors;
-use model::service_root::ServiceRoot;
+use model::service_root::{RedfishVendor, ServiceRoot};
 use model::software_inventory::SoftwareInventory;
 pub use model::system::{BootOptions, PCIeDevice, PowerState, SystemPowerControl, Systems};
 use model::task::Task;
 use model::update_service::{ComponentType, TransferProtocolType, UpdateService};
 pub use model::EnabledDisabled;
 use model::Manager;
-use model::{secure_boot::SecureBoot, BootOption, ComputerSystem, ODataId, PCIeFunction};
+use model::{secure_boot::SecureBoot, BootOption, ComputerSystem, ODataId};
 use serde::{Deserialize, Serialize};
 mod dell;
 mod error;
@@ -24,6 +45,7 @@ mod hpe;
 mod lenovo;
 mod network;
 mod nvidia_dpu;
+
 mod nvidia_gbx00;
 mod nvidia_viking;
 mod supermicro;
@@ -31,6 +53,7 @@ pub use network::{Endpoint, RedfishClientPool, RedfishClientPoolBuilder, REDFISH
 pub mod standard;
 pub use error::RedfishError;
 
+use crate::model::certificate::Certificate;
 use crate::model::power::Power;
 use crate::model::sel::LogEntry;
 use crate::model::storage::Drives;
@@ -65,6 +88,9 @@ pub trait Redfish: Send + Sync + 'static {
         password: &str,
         role_id: RoleId,
     ) -> Result<(), RedfishError>;
+
+    /// Delete a BMC user
+    async fn delete_user(&self, username: &str) -> Result<(), RedfishError>;
 
     // Get firmware version for particular firmware inventory id
     async fn get_firmware(&self, id: &str) -> Result<SoftwareInventory, RedfishError>;
@@ -105,9 +131,25 @@ pub trait Redfish: Send + Sync + 'static {
     /// Enables Secure Boot
     async fn enable_secure_boot(&self) -> Result<(), RedfishError>;
 
+    async fn get_secure_boot_certificate(
+        &self,
+        database_id: &str,
+        certificate_id: &str,
+    ) -> Result<Certificate, RedfishError>;
+
+    async fn get_secure_boot_certificates(
+        &self,
+        database_id: &str,
+    ) -> Result<Vec<String>, RedfishError>;
+
     /// Adds certificate to secure boot DB
+    /// database_id: "db" for database, "pk" for PK database
     /// Need to reboot DPU for UEFI Redfish client to execute.
-    async fn add_secure_boot_certificate(&self, pem_cert: &str) -> Result<Task, RedfishError>;
+    async fn add_secure_boot_certificate(
+        &self,
+        pem_cert: &str,
+        database_id: &str,
+    ) -> Result<Task, RedfishError>;
 
     /// Power supplies and voltages metrics
     async fn get_power_metrics(&self) -> Result<Power, RedfishError>;
@@ -137,18 +179,38 @@ pub trait Redfish: Send + Sync + 'static {
     /// get system event log similar to ipmitool sel
     async fn get_system_event_log(&self) -> Result<Vec<LogEntry>, RedfishError>;
 
+    /// get bmc event log (power events, etc.)
+    async fn get_bmc_event_log(
+        &self,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<LogEntry>, RedfishError>;
+
     /// get drives metrics
     async fn get_drives_metrics(&self) -> Result<Vec<Drives>, RedfishError>;
 
-    /// Is everything that machine_setup does already done?
-    async fn machine_setup_status(&self) -> Result<MachineSetupStatus, RedfishError>;
-
-    /// call this to setup bios and bmc for use
+    /// Sets up a reasonable UEFI configuration.
     /// remember to call lockdown() afterwards to secure the server
     /// - boot_interface_mac: MAC Address of the NIC you wish to boot from
     ///   If not given we look for a Mellanox Bluefield DPU and use that.
     ///   Not applicable to Supermicro and the DPU itself.
-    async fn machine_setup(&self, boot_interface_mac: Option<&str>) -> Result<(), RedfishError>;
+    /// bios_profiles: Map of vendor/model (with spaces replaced by underscores)/profile/type
+    ///   to extra settings; expected to come from config rather than hardcoded.
+    /// selected_profile: Profile to use (if present)
+    async fn machine_setup(
+        &self,
+        boot_interface_mac: Option<&str>,
+        bios_profiles: &BiosProfileVendor,
+        selected_profile: BiosProfileType,
+    ) -> Result<(), RedfishError>;
+
+    /// Is everything that machine_setup does already done?
+    async fn machine_setup_status(
+        &self,
+        boot_interface_mac: Option<&str>,
+    ) -> Result<MachineSetupStatus, RedfishError>;
+
+    /// Check if only the BIOS/BMC setup is done
+    async fn is_bios_setup(&self, boot_interface_mac: Option<&str>) -> Result<bool, RedfishError>;
 
     /// Apply a standard BMC password policy. This varies a lot by vendor,
     /// but at a minimum we want passwords to never expire, because our BMCs are
@@ -202,7 +264,7 @@ pub trait Redfish: Send + Sync + 'static {
 
     /// This action shall update installed software components in a software image file located at an ImageURI parameter-specified URI.
     /// image_uri - The URI of the software image to install.
-    /// transfer_protocol - The network protocol that the update service uses to retrieve the software image file located at the URI provided in ImageURI.  
+    /// transfer_protocol - The network protocol that the update service uses to retrieve the software image file located at the URI provided in ImageURI.
     /// This parameter is ignored if the URI provided in ImageURI contains a scheme.
     /// targets - An array of URIs that indicate where to apply the update image.
     async fn update_firmware_simple_update(
@@ -217,6 +279,15 @@ pub trait Redfish: Send + Sync + 'static {
      */
     /// All the BIOS values for this provider. Very OEM specific.
     async fn bios(&self) -> Result<HashMap<String, serde_json::Value>, RedfishError>;
+
+    /// Modify specific BIOS values.  Also very OEM and model specific.
+    async fn set_bios(
+        &self,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Result<(), RedfishError>;
+
+    /// Reset BIOS to factory settings
+    async fn reset_bios(&self) -> Result<(), RedfishError>;
 
     /// Pending BIOS attributes. Changes that were requested but not applied yet because
     /// they need a reboot.
@@ -245,6 +316,9 @@ pub trait Redfish: Send + Sync + 'static {
     // Get Chassis details
     async fn get_chassis(&self, id: &str) -> Result<Chassis, RedfishError>;
 
+    // Get Chassis Assembly details
+    async fn get_chassis_assembly(&self, chassis_id: &str) -> Result<Assembly, RedfishError>;
+
     // List all Network Adapters for the specific Chassis
     async fn get_chassis_network_adapters(
         &self,
@@ -272,10 +346,19 @@ pub trait Redfish: Send + Sync + 'static {
     ) -> Result<NetworkAdapter, RedfishError>;
 
     // List all High Speed Ports of a given Chassis
-    async fn get_ports(&self, chassis_id: &str, network_adapter: &str) -> Result<Vec<String>, RedfishError>;
+    async fn get_ports(
+        &self,
+        chassis_id: &str,
+        network_adapter: &str,
+    ) -> Result<Vec<String>, RedfishError>;
 
     // Get High Speed Port details
-    async fn get_port(&self, chassis_id: &str, network_adapter: &str, id: &str) -> Result<NetworkPort, RedfishError>;
+    async fn get_port(
+        &self,
+        chassis_id: &str,
+        network_adapter: &str,
+        id: &str,
+    ) -> Result<NetworkPort, RedfishError>;
 
     // List all Ethernet Interfaces for the default `Manager`
     async fn get_manager_ethernet_interfaces(&self) -> Result<Vec<String>, RedfishError>;
@@ -356,8 +439,10 @@ pub trait Redfish: Send + Sync + 'static {
     /// It will choose Uefi Http IPv4 option if any.
     /// If dpu's mac can be passed in as  mac_address to identify the dpu, otherwise method will attempt to find the dpu
     /// by enumeration NetworkAdapters and associated resources.
-    async fn set_boot_order_dpu_first(&self, mac_address: Option<&str>)
-        -> Result<(), RedfishError>;
+    async fn set_boot_order_dpu_first(
+        &self,
+        mac_address: &str,
+    ) -> Result<Option<String>, RedfishError>;
 
     async fn clear_uefi_password(
         &self,
@@ -378,6 +463,49 @@ pub trait Redfish: Send + Sync + 'static {
 
     // Only applicable to Vikings
     async fn clear_nvram(&self) -> Result<(), RedfishError>;
+
+    // Only applicable to DPUs
+    async fn get_nic_mode(&self) -> Result<Option<NicMode>, RedfishError>;
+
+    // Only applicable to DPUs
+    async fn set_nic_mode(&self, mode: NicMode) -> Result<(), RedfishError>;
+
+    /// Enable infinite boot
+    async fn enable_infinite_boot(&self) -> Result<(), RedfishError>;
+
+    /// Check if infinite boot is enabled
+    async fn is_infinite_boot_enabled(&self) -> Result<Option<bool>, RedfishError>;
+
+    // Only applicable to DPUs
+    async fn set_host_rshim(&self, enabled: EnabledDisabled) -> Result<(), RedfishError>;
+
+    // Only applicable to DPUs
+    async fn get_host_rshim(&self) -> Result<Option<EnabledDisabled>, RedfishError>;
+
+    // Only applicable to Dells
+    async fn set_idrac_lockdown(&self, enabled: EnabledDisabled) -> Result<(), RedfishError>;
+
+    // Only applicable to Dells
+    async fn get_boss_controller(&self) -> Result<Option<String>, RedfishError>;
+
+    // Only applicable to Dells
+    async fn decommission_storage_controller(
+        &self,
+        controller_id: &str,
+    ) -> Result<Option<String>, RedfishError>;
+
+    // Only applicable to Dells
+    async fn create_storage_volume(
+        &self,
+        controller_id: &str,
+        volume_name: &str,
+        raid_type: &str,
+    ) -> Result<Option<String>, RedfishError>;
+
+    fn ac_powercycle_supported_by_power(&self) -> bool;
+
+    /// Check if the boot order is configured as we expect (Network boot)
+    async fn is_boot_order_setup(&self, mac_address: &str) -> Result<bool, RedfishError>;
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -515,6 +643,7 @@ impl fmt::Display for MachineSetupDiff {
 #[serde(rename_all = "lowercase")] // No tag requried - this is not nested
 pub enum JobState {
     Scheduled,
+    ScheduledWithErrors,
     Running,
     Completed,
     CompletedWithErrors,
@@ -531,4 +660,23 @@ impl JobState {
             _ => JobState::Unknown,
         }
     }
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash, Copy, clap::ValueEnum, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum BiosProfileType {
+    #[default]
+    Performance,
+    PowerEfficiency,
+}
+
+pub type BiosProfileProfiles = HashMap<BiosProfileType, HashMap<String, serde_json::Value>>;
+pub type BiosProfileModel = HashMap<String, BiosProfileProfiles>;
+pub type BiosProfileVendor = HashMap<RedfishVendor, BiosProfileModel>;
+
+// Simplify model names so that we can put them in toml files as categories
+pub fn model_coerce(original: &str) -> String {
+    str::replace(original, " ", "_")
 }

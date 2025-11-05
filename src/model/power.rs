@@ -1,5 +1,4 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -20,9 +19,9 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
-use serde::{Deserialize, Serialize};
-use crate::model::sensor::Sensor;
 use super::{LinkType, ODataId, ODataLinks, ResourceStatus, StatusVec};
+use crate::model::sensor::Sensor;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
@@ -58,10 +57,10 @@ pub struct PowerLimit {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct PowerMetrics {
-    pub average_consumed_watts: i64, // we need to track this metric
-    pub interval_in_min: i64,
-    pub max_consumed_watts: i64,
-    pub min_consumed_watts: i64,
+    pub average_consumed_watts: Option<i64>, // we need to track this metric
+    pub interval_in_min: Option<i64>,
+    pub max_consumed_watts: Option<i64>,
+    pub min_consumed_watts: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -124,15 +123,15 @@ pub struct PowerSupply {
     pub efficiency_percent: Option<f64>, // not in Supermicro or NVIDIA DPU
     pub hot_pluggable: Option<bool>,
     pub manufacturer: Option<String>,
-    pub model: String,
+    pub model: Option<String>,
     pub name: String,
     pub input_ranges: Option<Vec<InputRanges>>, // only present sometimes on Supermicro
     pub power_output_amps: Option<f64>,
-    pub power_capacity_watts: Option<f64>,      // present but 'null' on Supermicro
+    pub power_capacity_watts: Option<f64>, // present but 'null' on Supermicro
     pub power_input_watts: Option<f64>,
     pub power_output_watts: Option<f64>,
     pub power_supply_type: Option<String>,
-    pub serial_number: String,
+    pub serial_number: Option<String>,
     pub spare_part_number: Option<String>,
     pub part_number: Option<String>, // Supermicro
     pub status: ResourceStatus,
@@ -162,10 +161,9 @@ pub struct Voltages {
 
 impl From<Sensor> for Voltages {
     fn from(sensor: Sensor) -> Self {
-        let physical_context = match sensor.physical_context {
-            Some(physical_context) => Some(physical_context.to_string()),
-            None => None,
-        };
+        let physical_context = sensor
+            .physical_context
+            .map(|physical_context| physical_context.to_string());
         Self {
             name: sensor.name.unwrap_or_default(),
             physical_context,

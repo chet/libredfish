@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,10 +24,15 @@ use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
+use crate::OData;
+
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct ManagerAccount {
+    #[serde(flatten)]
+    pub odata: OData,
+
     // Set on GET. Do not set for POST/PATCH
     pub id: Option<String>,
 

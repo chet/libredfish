@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -132,5 +132,14 @@ impl RedfishError {
                 response_body: _,
             } if *status_code == StatusCode::UNAUTHORIZED
                 || *status_code == StatusCode::FORBIDDEN)
+    }
+
+    pub fn not_found(&self) -> bool {
+        // clippy wants use of matches! macro
+        matches!(self, RedfishError::HTTPErrorCode {
+                url: _,
+                status_code,
+                response_body: _,
+            } if *status_code == StatusCode::NOT_FOUND)
     }
 }

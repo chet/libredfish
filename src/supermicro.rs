@@ -1,41 +1,47 @@
 /*
-* SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-* SPDX-License-Identifier: MIT
-*
-* Permission is hereby granted, free of charge, to any person obtaining a
-* copy of this software and associated documentation files (the "Software"),
-* to deal in the Software without restriction, including without limitation
-* the rights to use, copy, modify, merge, publish, distribute, sublicense,
-* and/or sell copies of the Software, and to permit persons to whom the
-* Software is furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-* DEALINGS IN THE SOFTWARE.
-*/
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: MIT
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use reqwest::StatusCode;
+use serde::Serialize;
+use tokio::fs::File;
 
 use crate::{
     model::{
         account_service::ManagerAccount,
         boot,
-        chassis::{Chassis, NetworkAdapter},
+        certificate::Certificate,
+        chassis::{Assembly, Chassis, NetworkAdapter},
         network_device_function::NetworkDeviceFunction,
-        oem::supermicro::{self, FixedBootOrder},
+        oem::{
+            nvidia_dpu::NicMode,
+            supermicro::{self, FixedBootOrder},
+        },
         power::Power,
         secure_boot::SecureBoot,
         sel::LogEntry,
         sensor::GPUSensors,
-        service_root::ServiceRoot,
+        service_root::{RedfishVendor, ServiceRoot},
         software_inventory::SoftwareInventory,
         storage::Drives,
         task::Task,
@@ -44,12 +50,13 @@ use crate::{
         BootOption, ComputerSystem, EnableDisable, InvalidValueError, Manager,
     },
     standard::RedfishStandard,
-    Boot, BootOptions, Collection, EnabledDisabled, MachineSetupDiff, MachineSetupStatus, JobState,
-    ODataId, PCIeDevice, PowerState, Redfish, RedfishError, Resource, RoleId, Status,
-    StatusInternal, SystemPowerControl,
+    BiosProfileType, Boot, BootOptions, Collection, EnabledDisabled, JobState, MachineSetupDiff,
+    MachineSetupStatus, ODataId, PCIeDevice, PowerState, Redfish, RedfishError, Resource, RoleId,
+    Status, StatusInternal, SystemPowerControl,
 };
 
-const MELLANOX_UEFI_HTTP4: &str = "UEFI HTTP IPv4 Mellanox Network Adapter";
+const MELLANOX_UEFI_HTTP_IPV4: &str = "UEFI HTTP IPv4 Mellanox Network Adapter";
+const NVIDIA_UEFI_HTTP_IPV4: &str = "UEFI HTTP IPv4 Nvidia Network Adapter";
 const HARD_DISK: &str = "UEFI Hard Disk";
 const NETWORK: &str = "UEFI Network";
 
@@ -72,6 +79,10 @@ impl Redfish for Bmc {
         role_id: RoleId,
     ) -> Result<(), RedfishError> {
         self.s.create_user(username, password, role_id).await
+    }
+
+    async fn delete_user(&self, username: &str) -> Result<(), RedfishError> {
+        self.s.delete_user(username).await
     }
 
     async fn change_username(&self, old_name: &str, new_name: &str) -> Result<(), RedfishError> {
@@ -107,7 +118,20 @@ impl Redfish for Bmc {
     }
 
     async fn power(&self, action: SystemPowerControl) -> Result<(), RedfishError> {
+        if action == SystemPowerControl::ACPowercycle {
+            let args: HashMap<String, String> =
+                HashMap::from([("ResetType".to_string(), "ACCycle".to_string())]);
+            let url = format!(
+                "Systems/{}/Actions/Oem/OemSystemExtensions.Reset",
+                self.s.system_id()
+            );
+            return self.s.client.post(&url, args).await.map(|_status_code| ());
+        }
         self.s.power(action).await
+    }
+
+    fn ac_powercycle_supported_by_power(&self) -> bool {
+        true
     }
 
     async fn bmc_reset(&self) -> Result<(), RedfishError> {
@@ -134,6 +158,13 @@ impl Redfish for Bmc {
         self.s.get_system_event_log().await
     }
 
+    async fn get_bmc_event_log(
+        &self,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<LogEntry>, RedfishError> {
+        self.s.get_bmc_event_log(from).await
+    }
+
     async fn get_drives_metrics(&self) -> Result<Vec<Drives>, RedfishError> {
         self.s.get_drives_metrics().await
     }
@@ -142,10 +173,29 @@ impl Redfish for Bmc {
         self.s.bios().await
     }
 
+    async fn set_bios(
+        &self,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Result<(), RedfishError> {
+        self.s.set_bios(values).await
+    }
+
+    async fn reset_bios(&self) -> Result<(), RedfishError> {
+        self.s.factory_reset_bios().await
+    }
+
     /// Note that you can't use this for initial setup unless you reboot and run it twice.
     /// `boot_first` won't find the Mellanox HTTP device. `uefi_nic_boot_attrs` enables it,
     /// but it won't show until after reboot so that step will fail on first time through.
-    async fn machine_setup(&self, _boot_interface_mac: Option<&str>) -> Result<(), RedfishError> {
+    async fn machine_setup(
+        &self,
+        _boot_interface_mac: Option<&str>,
+        _bios_profiles: &HashMap<
+            RedfishVendor,
+            HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
+        >,
+        _selected_profile: BiosProfileType,
+    ) -> Result<(), RedfishError> {
         self.setup_serial_console().await?;
 
         let bios_attrs = self.machine_setup_attrs().await?;
@@ -153,85 +203,29 @@ impl Redfish for Bmc {
         attrs.extend(bios_attrs);
         let body = HashMap::from([("Attributes", attrs)]);
         let url = format!("Systems/{}/Bios", self.s.system_id());
-        self.s
-            .client
-            .patch(&url, body)
-            .await
-            .map(|_status_code| ())?;
-
-        self.boot_first(Boot::Pxe).await
+        self.s.client.patch(&url, body).await.map(|_status_code| ())
     }
 
-    async fn machine_setup_status(&self) -> Result<MachineSetupStatus, RedfishError> {
-        let mut diffs = vec![];
+    async fn machine_setup_status(
+        &self,
+        boot_interface_mac: Option<&str>,
+    ) -> Result<MachineSetupStatus, RedfishError> {
+        // Check BIOS and BMC attributes
+        let mut diffs = self.diff_bios_bmc_attr().await?;
 
-        let sc = self.serial_console_status().await?;
-        if !sc.is_fully_enabled() {
-            diffs.push(MachineSetupDiff {
-                key: "serial_console".to_string(),
-                expected: "Enabled".to_string(),
-                actual: sc.status.to_string(),
-            });
-        }
-
-        let bios = self.s.bios_attributes().await?;
-        let expected_attrs = self.machine_setup_attrs().await?;
-        for (key, expected) in expected_attrs {
-            let Some(actual) = bios.get(&key) else {
+        // Check the first boot option
+        if let Some(mac) = boot_interface_mac {
+            let (expected, actual) = self.get_expected_and_actual_first_boot_option(mac).await?;
+            if expected.is_none() || expected != actual {
                 diffs.push(MachineSetupDiff {
-                    key: key.to_string(),
-                    expected: expected.to_string(),
-                    actual: "_missing_".to_string(),
-                });
-                continue;
-            };
-            // expected and actual are serde_json::Value which are not comparable, so to_string
-            let act = actual.to_string();
-            let exp = expected.to_string();
-            if act != exp {
-                diffs.push(MachineSetupDiff {
-                    key: key.to_string(),
-                    expected: exp,
-                    actual: act,
+                    key: "boot_first".to_string(),
+                    expected: expected.unwrap_or_else(|| "Not found".to_string()),
+                    actual: actual.unwrap_or_else(|| "Not found".to_string()),
                 });
             }
         }
 
-        // Supermicro starting from H13/X13 has an Oem/FixedBootOrder separate from regular boot order
-        // Must boot from network
-        match self.get_boot_order().await {
-            Ok(fbo) => {
-                let actual = fbo.fixed_boot_order.first();
-                if actual.map(|s| s.as_str()) != Some(NETWORK) {
-                    diffs.push(MachineSetupDiff {
-                        key: "boot_order".to_string(),
-                        expected: NETWORK.to_string(),
-                        actual: format!("{actual:?}"),
-                    });
-                }
-            }
-            // Older Supermicro platforms still use BootOrder, we can skip that check for them
-            Err(RedfishError::HTTPErrorCode {
-                status_code: StatusCode::NOT_FOUND,
-                ..
-            }) => {}
-            Err(e) => return Err(e),
-        }
-        // The DPU should be the first NIC we try
-        let boot_first = self.s.get_first_boot_option().await?;
-        // We replacing colon as different version of Supermicro platform show name differently
-        if !boot_first
-            .display_name
-            .replace(":", "")
-            .contains(MELLANOX_UEFI_HTTP4)
-        {
-            diffs.push(MachineSetupDiff {
-                key: "boot_first".to_string(),
-                expected: MELLANOX_UEFI_HTTP4.to_string(),
-                actual: boot_first.display_name,
-            });
-        }
-
+        // Check lockdown status
         let lockdown = self.lockdown_status().await?;
         if !lockdown.is_fully_enabled() {
             diffs.push(MachineSetupDiff {
@@ -265,7 +259,10 @@ impl Redfish for Bmc {
         use EnabledDisabled::*;
         match target {
             Enabled => {
-                self.set_host_interfaces(Disabled).await?;
+                // Grace-Grace SMCs can't PXE boot if host interface is disabled
+                if !self.is_grace_grace_smc().await? {
+                    self.set_host_interfaces(Disabled).await?;
+                }
                 self.set_kcs_privilege(supermicro::Privilege::Callback)
                     .await?;
                 self.set_syslockdown(Enabled).await?; // Lock last
@@ -282,13 +279,36 @@ impl Redfish for Bmc {
 
     async fn lockdown_status(&self) -> Result<Status, RedfishError> {
         let is_hi_on = self.is_host_interface_enabled().await?;
-        let kcs_privilege = self.get_kcs_privilege().await?;
+        let kcs_privilege = match self.get_kcs_privilege().await {
+            Ok(priviledge) => Ok(Some(priviledge)),
+            Err(e) => {
+                // The Grace-Grace Supermicros in our GB200 lab do not seem to support
+                // querying KCS access from the host to its BMC. Use this workaround to
+                // temporarily enable ingesting these servers.
+                if e.not_found() {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }?;
+
         let is_syslockdown = self.get_syslockdown().await?;
-        let message = format!("SysLockdownEnabled={is_syslockdown}, kcs_privilege={kcs_privilege}, host_interface_enabled={is_hi_on}");
-        let is_locked =
-            is_syslockdown && kcs_privilege == supermicro::Privilege::Callback && !is_hi_on;
-        let is_unlocked =
-            !is_syslockdown && kcs_privilege == supermicro::Privilege::Administrator && is_hi_on;
+        let message = format!("SysLockdownEnabled={is_syslockdown}, kcs_privilege={kcs_privilege:#?}, host_interface_enabled={is_hi_on}");
+
+        // Grace-Grace SMCs (ARS-121L-DNR) need host_interface enabled even with lockdown
+        let is_grace_grace = self.is_grace_grace_smc().await?;
+
+        let is_locked = is_syslockdown
+            && kcs_privilege
+                .clone()
+                .unwrap_or(supermicro::Privilege::Callback)
+                == supermicro::Privilege::Callback
+            && (is_grace_grace || !is_hi_on);
+        let is_unlocked = !is_syslockdown
+            && kcs_privilege.unwrap_or(supermicro::Privilege::Administrator)
+                == supermicro::Privilege::Administrator
+            && is_hi_on;
         Ok(Status {
             message,
             status: if is_locked {
@@ -339,16 +359,11 @@ impl Redfish for Bmc {
 
     /// Boot from this device once then go back to the normal boot order
     async fn boot_once(&self, target: Boot) -> Result<(), RedfishError> {
-        if target == Boot::Pxe || target == Boot::UefiHttp {
-            let _ = self.set_mellanox_first().await;
-        }
         self.set_boot_override(target, true).await
     }
 
     /// Set which device we should boot from first.
     async fn boot_first(&self, target: Boot) -> Result<(), RedfishError> {
-        let _ = self.set_mellanox_first().await;
-
         // Try with FixedBootOptions and fallback to BootOptions if fails
         match self.set_boot_order(target).await {
             Err(RedfishError::HTTPErrorCode {
@@ -429,13 +444,51 @@ impl Redfish for Bmc {
     async fn update_firmware_multipart(
         &self,
         filename: &Path,
-        reboot: bool,
+        _reboot: bool,
         timeout: Duration,
         component_type: ComponentType,
     ) -> Result<String, RedfishError> {
-        self.s
-            .update_firmware_multipart(filename, reboot, timeout, component_type)
+        let firmware = File::open(&filename)
             .await
+            .map_err(|e| RedfishError::FileError(format!("Could not open file: {}", e)))?;
+
+        let update_service = self.s.get_update_service().await?;
+
+        if update_service.multipart_http_push_uri.is_empty() {
+            return Err(RedfishError::NotSupported(
+                "Host BMC does not support HTTP multipart push".to_string(),
+            ));
+        }
+
+        let parameters =
+            serde_json::to_string(&UpdateParameters::new(component_type)).map_err(|e| {
+                RedfishError::JsonSerializeError {
+                    url: "".to_string(),
+                    object_debug: "".to_string(),
+                    source: e,
+                }
+            })?;
+        let (_status_code, _loc, body) = self
+            .s
+            .client
+            .req_update_firmware_multipart(
+                filename,
+                firmware,
+                parameters,
+                &update_service.multipart_http_push_uri,
+                true,
+                timeout,
+            )
+            .await?;
+
+        let task: Task =
+            serde_json::from_str(&body).map_err(|e| RedfishError::JsonDeserializeError {
+                url: update_service.multipart_http_push_uri,
+                body,
+                source: e,
+            })?;
+
+        Ok(task.id)
     }
 
     async fn get_update_service(&self) -> Result<UpdateService, RedfishError> {
@@ -462,8 +515,31 @@ impl Redfish for Bmc {
         self.s.get_system().await
     }
 
-    async fn add_secure_boot_certificate(&self, pem_cert: &str) -> Result<Task, RedfishError> {
-        self.s.add_secure_boot_certificate(pem_cert).await
+    async fn get_secure_boot_certificates(
+        &self,
+        database_id: &str,
+    ) -> Result<Vec<String>, RedfishError> {
+        self.s.get_secure_boot_certificates(database_id).await
+    }
+
+    async fn get_secure_boot_certificate(
+        &self,
+        database_id: &str,
+        certificate_id: &str,
+    ) -> Result<Certificate, RedfishError> {
+        self.s
+            .get_secure_boot_certificate(database_id, certificate_id)
+            .await
+    }
+
+    async fn add_secure_boot_certificate(
+        &self,
+        pem_cert: &str,
+        database_id: &str,
+    ) -> Result<Task, RedfishError> {
+        self.s
+            .add_secure_boot_certificate(pem_cert, database_id)
+            .await
     }
 
     async fn get_secure_boot(&self) -> Result<SecureBoot, RedfishError> {
@@ -504,6 +580,10 @@ impl Redfish for Bmc {
         self.s.get_chassis(id).await
     }
 
+    async fn get_chassis_assembly(&self, chassis_id: &str) -> Result<Assembly, RedfishError> {
+        self.s.get_chassis_assembly(chassis_id).await
+    }
+
     async fn get_chassis_network_adapters(
         &self,
         chassis_id: &str,
@@ -534,7 +614,11 @@ impl Redfish for Bmc {
         self.s.get_base_network_adapter(system_id, id).await
     }
 
-    async fn get_ports(&self, chassis_id: &str, network_adapter: &str) -> Result<Vec<String>, RedfishError> {
+    async fn get_ports(
+        &self,
+        chassis_id: &str,
+        network_adapter: &str,
+    ) -> Result<Vec<String>, RedfishError> {
         self.s.get_ports(chassis_id, network_adapter).await
     }
 
@@ -617,11 +701,92 @@ impl Redfish for Bmc {
         self.s.get_resource(id).await
     }
 
+    /// Set the DPU to be our first netboot device.
+    /// The HTTP adapter will only appear after IPv4HTTPSupport bios setting is enabled and the host rebooted.
     async fn set_boot_order_dpu_first(
         &self,
-        mac_address: Option<&str>,
-    ) -> Result<(), RedfishError> {
-        self.s.set_boot_order_dpu_first(mac_address).await
+        mac_address: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        match self.set_mellanox_first(mac_address).await {
+            Ok(_) => return Ok(None),
+            Err(RedfishError::HTTPErrorCode {
+                status_code,
+                response_body,
+                ..
+            }) if status_code == reqwest::StatusCode::BAD_REQUEST
+                && response_body.contains("PropertyUnknown")
+                && response_body.contains("BootOrder") =>
+            {
+                // Fall back to the following method if we get this error:
+                // HTTP 400 - "The property BootOrder is not in the list of valid properties for the resource"
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Some supermicro models don't support the set_mellanox_first method, so we fall back to this method
+        let mut fbo = self.get_boot_order().await?;
+
+        // The network name is not consistent because it includes the interface name
+        let Some(network) = fbo
+            .fixed_boot_order
+            .iter()
+            .find(|entry| entry.starts_with(NETWORK))
+        else {
+            return Err(RedfishError::NotSupported(format!(
+                "No match for {NETWORK} in top level boot order"
+            )));
+        };
+
+        // The hard disk name is also not consistent because it includes the device specifics
+        let Some(hard_disk) = fbo
+            .fixed_boot_order
+            .iter()
+            .find(|entry| entry.starts_with(HARD_DISK))
+        else {
+            return Err(RedfishError::NotSupported(format!(
+                "No match for {HARD_DISK} in top level boot order"
+            )));
+        };
+
+        // Make network the first option, hard disk second, and everything else disabled
+        let mut order = ["Disabled"].repeat(fbo.fixed_boot_order.len());
+        order[0] = network;
+        order[1] = hard_disk;
+
+        // Set the DPU to be the first network device to boot from
+        let Some(pos) = fbo
+            .uefi_network
+            .iter()
+            .position(|s| s.contains("UEFI HTTP IPv4 Mellanox") && s.contains(mac_address))
+            .or_else(|| {
+                fbo.uefi_network
+                    .iter()
+                    .position(|s| s.contains("UEFI HTTP IPv4 Nvidia") && s.contains(mac_address))
+            })
+        else {
+            return Err(RedfishError::NotSupported(
+                format!("No match for Mellanox/Nvidia HTTP adapter with MAC address {} in network boot order", mac_address)
+            ));
+        };
+        fbo.uefi_network.swap(0, pos);
+
+        let url = format!(
+            "Systems/{}/Oem/Supermicro/FixedBootOrder",
+            self.s.system_id()
+        );
+        let body = HashMap::from([
+            ("FixedBootOrder", order),
+            (
+                "UEFINetwork",
+                fbo.uefi_network.iter().map(|s| s.as_ref()).collect(),
+            ),
+        ]);
+        self.s
+            .client
+            .patch(&url, body)
+            .await
+            .map(|_status_code| ())?;
+        Ok(None)
     }
 
     async fn clear_uefi_password(
@@ -668,9 +833,176 @@ impl Redfish for Bmc {
     async fn clear_nvram(&self) -> Result<(), RedfishError> {
         self.s.clear_nvram().await
     }
+
+    async fn get_nic_mode(&self) -> Result<Option<NicMode>, RedfishError> {
+        self.s.get_nic_mode().await
+    }
+
+    async fn set_nic_mode(&self, mode: NicMode) -> Result<(), RedfishError> {
+        self.s.set_nic_mode(mode).await
+    }
+
+    async fn enable_infinite_boot(&self) -> Result<(), RedfishError> {
+        self.s.enable_infinite_boot().await
+    }
+
+    async fn is_infinite_boot_enabled(&self) -> Result<Option<bool>, RedfishError> {
+        self.s.is_infinite_boot_enabled().await
+    }
+
+    async fn set_host_rshim(&self, enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        self.s.set_host_rshim(enabled).await
+    }
+
+    async fn get_host_rshim(&self) -> Result<Option<EnabledDisabled>, RedfishError> {
+        self.s.get_host_rshim().await
+    }
+
+    async fn set_idrac_lockdown(&self, enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        self.s.set_idrac_lockdown(enabled).await
+    }
+
+    async fn get_boss_controller(&self) -> Result<Option<String>, RedfishError> {
+        self.s.get_boss_controller().await
+    }
+
+    async fn decommission_storage_controller(
+        &self,
+        controller_id: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        self.s.decommission_storage_controller(controller_id).await
+    }
+
+    async fn create_storage_volume(
+        &self,
+        controller_id: &str,
+        volume_name: &str,
+        raid_type: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        self.s
+            .create_storage_volume(controller_id, volume_name, raid_type)
+            .await
+    }
+
+    async fn is_boot_order_setup(&self, boot_interface_mac: &str) -> Result<bool, RedfishError> {
+        let (expected, actual) = self
+            .get_expected_and_actual_first_boot_option(boot_interface_mac)
+            .await?;
+        Ok(expected.is_some() && expected == actual)
+    }
+
+    async fn is_bios_setup(&self, _boot_interface_mac: Option<&str>) -> Result<bool, RedfishError> {
+        let diffs = self.diff_bios_bmc_attr().await?;
+        Ok(diffs.is_empty())
+    }
 }
 
 impl Bmc {
+    /// Check BIOS and BMC attributes and return differences
+    async fn diff_bios_bmc_attr(&self) -> Result<Vec<MachineSetupDiff>, RedfishError> {
+        let mut diffs = vec![];
+
+        let sc = self.serial_console_status().await?;
+        if !sc.is_fully_enabled() {
+            diffs.push(MachineSetupDiff {
+                key: "serial_console".to_string(),
+                expected: "Enabled".to_string(),
+                actual: sc.status.to_string(),
+            });
+        }
+
+        let bios = self.s.bios_attributes().await?;
+        let expected_attrs = self.machine_setup_attrs().await?;
+        for (key, expected) in expected_attrs {
+            let Some(actual) = bios.get(&key) else {
+                diffs.push(MachineSetupDiff {
+                    key: key.to_string(),
+                    expected: expected.to_string(),
+                    actual: "_missing_".to_string(),
+                });
+                continue;
+            };
+            // expected and actual are serde_json::Value which are not comparable, so to_string
+            let act = actual.to_string();
+            let exp = expected.to_string();
+            if act != exp {
+                diffs.push(MachineSetupDiff {
+                    key: key.to_string(),
+                    expected: exp,
+                    actual: act,
+                });
+            }
+        }
+
+        Ok(diffs)
+    }
+
+    async fn get_expected_and_actual_first_boot_option(
+        &self,
+        boot_interface_mac: &str,
+    ) -> Result<(Option<String>, Option<String>), RedfishError> {
+        // Try using standard BootOptions first
+        match self.s.get_boot_options().await {
+            Ok(all) => {
+                // Get actual first boot option
+                let actual_first_boot_option = if let Some(first) = all.members.first() {
+                    let id = first.odata_id_get()?;
+                    Some(self.s.get_boot_option(id).await?.display_name)
+                } else {
+                    None
+                };
+
+                // Find expected boot option
+                let mut expected_first_boot_option = None;
+                for b in &all.members {
+                    let id = b.odata_id_get()?;
+                    let boot_option = self.s.get_boot_option(id).await?;
+
+                    if (boot_option.display_name.contains(MELLANOX_UEFI_HTTP_IPV4)
+                        || boot_option.display_name.contains(NVIDIA_UEFI_HTTP_IPV4))
+                        && boot_option.display_name.contains(boot_interface_mac)
+                    {
+                        expected_first_boot_option = Some(boot_option.display_name);
+                        break;
+                    }
+                }
+
+                Ok((expected_first_boot_option, actual_first_boot_option))
+            }
+            Err(RedfishError::HTTPErrorCode {
+                status_code,
+                response_body,
+                ..
+            }) if status_code == reqwest::StatusCode::BAD_REQUEST
+                && response_body.contains("PropertyUnknown")
+                && response_body.contains("BootOrder") =>
+            {
+                // Fall back to FixedBootOrder for platforms that don't support standard BootOptions
+                let fbo = self.get_boot_order().await?;
+
+                // Get actual first boot option (strip prefix like "UEFI Network:", "UEFI Hard Disk:", etc.)
+                let actual_first_boot_option = fbo.fixed_boot_order.first().and_then(|entry| {
+                    // Find the first colon and take everything after it
+                    entry.find(':').map(|idx| entry[idx + 1..].to_string())
+                });
+
+                // Find expected boot option in UEFINetwork list
+                let expected_first_boot_option = fbo
+                    .uefi_network
+                    .iter()
+                    .find(|entry| {
+                        (entry.contains(MELLANOX_UEFI_HTTP_IPV4)
+                            || entry.contains(NVIDIA_UEFI_HTTP_IPV4))
+                            && entry.contains(boot_interface_mac)
+                    })
+                    .cloned();
+
+                Ok((expected_first_boot_option, actual_first_boot_option))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     async fn machine_setup_attrs(&self) -> Result<Vec<(String, serde_json::Value)>, RedfishError> {
         let mut bios_keys = self.bios_attributes_name_map().await?;
         let mut bios_attrs: Vec<(String, serde_json::Value)> = vec![];
@@ -701,9 +1033,43 @@ impl Bmc {
 
         // UEFI NIC boot
         add_keys!("IPv4HTTPSupport", EnabledDisabled::Enabled);
-        add_keys!("IPv4PXESupport", EnabledDisabled::Enabled);
-        add_keys!("IPv6HTTPSupport", EnabledDisabled::Enabled);
+        add_keys!("IPv4PXESupport", EnabledDisabled::Disabled);
+        add_keys!("IPv6HTTPSupport", EnabledDisabled::Disabled);
         add_keys!("IPv6PXESupport", EnabledDisabled::Disabled);
+
+        // Enable TPM - check current format and use matching enum
+        let current_attrs = self.s.bios_attributes().await?;
+        let tpm_value = current_attrs
+            .as_object()
+            .and_then(|attrs| {
+                attrs.iter().find(|(key, _)| {
+                    key.split('_')
+                        .next()
+                        .unwrap_or(key)
+                        .starts_with("SecurityDeviceSupport")
+                })
+            })
+            .and_then(|(_, value)| value.as_str());
+
+        if let Some(val) = tpm_value {
+            if val == EnabledDisabled::Enabled.to_string()
+                || val == EnabledDisabled::Disabled.to_string()
+            {
+                add_keys!("SecurityDeviceSupport", EnabledDisabled::Enabled)
+            } else if val == EnableDisable::Enable.to_string()
+                || val == EnableDisable::Disable.to_string()
+            {
+                add_keys!("SecurityDeviceSupport", EnableDisable::Enable)
+            } else {
+                return Err(RedfishError::GenericError {
+                    error: "Unexpected SecurityDeviceSupport value".to_string(),
+                });
+            }
+        } else {
+            return Err(RedfishError::GenericError {
+                error: "Missing SecurityDeviceSupport value".to_string(),
+            });
+        }
 
         Ok(bios_attrs)
     }
@@ -743,7 +1109,24 @@ impl Bmc {
             self.s.manager_id()
         );
         let body = HashMap::from([("Privilege", privilege.to_string())]);
-        self.s.client.patch(&url, body).await.map(|_status_code| ())
+        self.s
+            .client
+            .patch(&url, body)
+            .await
+            .or_else(|err| {
+                // The Grace-Grace Supermicros in our GB200 lab do not seem to support
+                // disabling KCS access from the host to its BMC. Use this workaround to
+                // temporarily enable ingesting these servers.
+                if err.not_found() {
+                    tracing::warn!(
+                        "Supermicro was uanble to find {url}: {err}; not returning error to caller"
+                    );
+                    Ok((StatusCode::OK, None))
+                } else {
+                    Err(err)
+                }
+            })
+            .map(|_status_code| ())
     }
 
     async fn is_host_interface_enabled(&self) -> Result<bool, RedfishError> {
@@ -935,17 +1318,21 @@ impl Bmc {
     /// will only appear after IPv4HTTPSupport bios setting is enabled and the host rebooted.
     /// If the Mellanox adapter is not first everything still works, but boot takes a little longer
     /// because it tries the other adapters too.
-    async fn set_mellanox_first(&self) -> Result<(), RedfishError> {
+    async fn set_mellanox_first(&self, boot_interface: &str) -> Result<(), RedfishError> {
         let mut with_name_match = None; // the ID of the option matching with_name
         let mut ordered = Vec::new(); // the final boot options
         let all = self.s.get_boot_options().await?;
         for b in all.members {
             let id = b.odata_id_get()?;
             let boot_option = self.s.get_boot_option(id).await?;
-            if boot_option
-                .display_name
-                .contains("UEFI HTTP IPv4 Mellanox Network Adapter")
+
+            if (boot_option.display_name.contains(MELLANOX_UEFI_HTTP_IPV4)
+                || boot_option.display_name.contains(NVIDIA_UEFI_HTTP_IPV4))
+                && boot_option.display_name.contains(boot_interface)
             {
+                // Here are the patterns we have seen so far:
+                // UEFI HTTP IPv4 Mellanox Network Adapter - A0:88:C2:EA:84:D0(MAC:A088C2EA84D0)
+                // UEFI HTTP IPv4 Nvidia Network Adapter - C4:70:BD:F0:40:AA - C470BDF040AA"
                 with_name_match = Some(boot_option.id);
             } else {
                 ordered.push(boot_option.id);
@@ -966,6 +1353,7 @@ impl Bmc {
     //       TXTSupport -> [TXTSupport#0062, TXTSupport#0072] }
     async fn bios_attributes_name_map(&self) -> Result<HashMap<String, Vec<String>>, RedfishError> {
         let bios_attrs = self.s.bios_attributes().await?;
+
         let Some(attrs_map) = bios_attrs.as_object() else {
             return Err(RedfishError::InvalidKeyType {
                 key: "Attributes".to_string(),
@@ -975,12 +1363,82 @@ impl Bmc {
         };
         let mut by_name: HashMap<String, Vec<String>> = HashMap::with_capacity(attrs_map.len());
         for k in attrs_map.keys() {
-            let clean_key = k.split('#').next().unwrap().to_string();
+            let clean_key = k.split('_').next().unwrap().to_string();
             by_name
                 .entry(clean_key)
                 .and_modify(|e| e.push(k.clone()))
                 .or_insert(vec![k.clone()]);
         }
         Ok(by_name)
+    }
+
+    // Check if this is a Grace-Grace SMC (ARS-121L-DNR) that needs host_interface enabled
+    async fn is_grace_grace_smc(&self) -> Result<bool, RedfishError> {
+        Ok(self
+            .s
+            .get_system()
+            .await?
+            .model
+            .unwrap_or_default()
+            .contains("ARS-121L-DNR"))
+    }
+}
+
+// UpdateParameters is what is sent for a multipart firmware upload's metadata.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct UpdateParameters {
+    targets: Vec<String>,
+    #[serde(rename = "@Redfish.OperationApplyTime")]
+    pub apply_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oem: Option<HashMap<String, HashMap<String, HashMap<String, bool>>>>,
+}
+
+impl UpdateParameters {
+    pub fn new(component_type: ComponentType) -> UpdateParameters {
+        let target = match component_type {
+            ComponentType::UEFI => "/redfish/v1/Systems/1/Bios",
+            ComponentType::BMC => "/redfish/v1/Managers/1",
+            ComponentType::CPLDMB => "/redfish/v1/UpdateService/FirmwareInventory/CPLD_Motherboard",
+            ComponentType::CPLDMID => {
+                "/redfish/v1/UpdateService/FirmwareInventory/CPLD_Backplane_1"
+            }
+            _ => "Unrecognized component type",
+        }
+        .to_string();
+
+        let oem = match component_type {
+            ComponentType::UEFI => Some(HashMap::from([(
+                "Supermicro".to_string(),
+                HashMap::from([(
+                    "BIOS".to_string(),
+                    HashMap::from([
+                        ("PreserveME".to_string(), true),
+                        ("PreserveNVRAM".to_string(), true),
+                        ("PreserveSMBIOS".to_string(), true),
+                        ("BackupBIOS".to_string(), false),
+                    ]),
+                )]),
+            )])),
+            ComponentType::BMC => Some(HashMap::from([(
+                "Supermicro".to_string(),
+                HashMap::from([(
+                    "BMC".to_string(),
+                    HashMap::from([
+                        ("PreserveCfg".to_string(), true),
+                        ("PreserveSdr".to_string(), true),
+                        ("PreserveSsl".to_string(), true),
+                        ("BackupBMC".to_string(), true),
+                    ]),
+                )]),
+            )])),
+            _ => None,
+        };
+        UpdateParameters {
+            targets: vec![target],
+            apply_time: "Immediate".to_string(),
+            oem,
+        }
     }
 }

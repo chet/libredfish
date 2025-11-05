@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -22,25 +22,29 @@
  */
 use std::{collections::HashMap, path::Path, time::Duration};
 
+use chrono::Utc;
+use regex::Regex;
 use reqwest::header::HeaderMap;
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::fs::File;
+use tokio::time::sleep;
 use tracing::debug;
 
 use crate::model::account_service::ManagerAccount;
-use crate::model::oem::lenovo::{FrontPanelUSB, LenovoBootOrder};
-use crate::model::resource::ResourceCollection;
+use crate::model::certificate::Certificate;
+use crate::model::oem::lenovo::{BootSettings, FrontPanelUSB, LenovoBootOrder};
+use crate::model::oem::nvidia_dpu::NicMode;
 use crate::model::sel::LogService;
-use crate::model::service_root::ServiceRoot;
+use crate::model::service_root::{RedfishVendor, ServiceRoot};
 use crate::model::task::Task;
 use crate::model::update_service::{ComponentType, TransferProtocolType, UpdateService};
 use crate::model::{secure_boot::SecureBoot, ComputerSystem};
-use crate::model::{InvalidValueError, Manager, PCIeFunction};
+use crate::model::{InvalidValueError, Manager};
 use crate::{
     model::{
-        chassis::{Chassis, NetworkAdapter},
+        chassis::{Assembly, Chassis, NetworkAdapter},
         network_device_function::NetworkDeviceFunction,
         oem::lenovo,
         power::Power,
@@ -53,9 +57,9 @@ use crate::{
     },
     network::REDFISH_ENDPOINT,
     standard::RedfishStandard,
-    Boot, BootOptions, Collection, EnabledDisabled, MachineSetupDiff, MachineSetupStatus, ODataId,
-    PCIeDevice, PowerState, Redfish, RedfishError, Resource, Status, StatusInternal,
-    SystemPowerControl,
+    BiosProfileType, Boot, BootOptions, Collection, EnabledDisabled, MachineSetupDiff,
+    MachineSetupStatus, ODataId, PCIeDevice, PowerState, Redfish, RedfishError, Resource, Status,
+    StatusInternal, SystemPowerControl,
 };
 use crate::{JobState, RoleId};
 
@@ -80,6 +84,10 @@ impl Redfish for Bmc {
         role_id: RoleId,
     ) -> Result<(), RedfishError> {
         self.s.create_user(username, password, role_id).await
+    }
+
+    async fn delete_user(&self, username: &str) -> Result<(), RedfishError> {
+        self.s.delete_user(username).await
     }
 
     async fn change_username(&self, old_name: &str, new_name: &str) -> Result<(), RedfishError> {
@@ -111,7 +119,38 @@ impl Redfish for Bmc {
     }
 
     async fn power(&self, action: SystemPowerControl) -> Result<(), RedfishError> {
-        self.s.power(action).await
+        if action == SystemPowerControl::ACPowercycle {
+            let args: HashMap<String, String> =
+                HashMap::from([("ResetType".to_string(), "ACPowerCycle".to_string())]);
+            let url = format!(
+                "Systems/{}/Actions/Oem/LenovoComputerSystem.SystemReset",
+                self.s.system_id()
+            );
+            return self.s.client.post(&url, args).await.map(|_status_code| ());
+        }
+
+        if action == SystemPowerControl::ForceRestart
+            && self.use_workaround_for_force_restart().await?
+        {
+            // We observed that issuing a ForceRestart to SR 675 V3 OVX machines can cause them to hang
+            // We have observed that GracefulRestart is not a reliable mechanism to reboot hosts.
+            // The most reliable workaround provided by Lenovo is to power off the machine, wait, and power on the machine
+            self.s.power(SystemPowerControl::ForceOff).await?;
+            sleep(Duration::from_secs(10)).await;
+            if self.get_power_state().await? != PowerState::Off {
+                return Err(RedfishError::GenericError {
+                    error: "Server did not turn off within 10 seconds after issuing a ForceOff"
+                        .to_string(),
+                });
+            }
+            self.s.power(SystemPowerControl::On).await
+        } else {
+            self.s.power(action).await
+        }
+    }
+
+    fn ac_powercycle_supported_by_power(&self) -> bool {
+        true
     }
 
     async fn bmc_reset(&self) -> Result<(), RedfishError> {
@@ -138,6 +177,17 @@ impl Redfish for Bmc {
         self.get_system_event_log().await
     }
 
+    async fn get_bmc_event_log(
+        &self,
+        from: Option<chrono::DateTime<Utc>>,
+    ) -> Result<Vec<LogEntry>, RedfishError> {
+        let url = format!(
+            "Systems/{}/LogServices/AuditLog/Entries",
+            self.s.system_id()
+        );
+        self.s.fetch_bmc_event_log(url, from).await
+    }
+
     async fn get_drives_metrics(&self) -> Result<Vec<Drives>, RedfishError> {
         self.s.get_drives_metrics().await
     }
@@ -146,71 +196,64 @@ impl Redfish for Bmc {
         self.s.bios().await
     }
 
-    async fn machine_setup(&self, boot_interface_mac: Option<&str>) -> Result<(), RedfishError> {
+    async fn set_bios(
+        &self,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Result<(), RedfishError> {
+        let mut body = HashMap::new();
+        body.insert("Attributes", values);
+        let url = format!("Systems/{}/Bios/Pending", self.s.system_id());
+        self.s.client.patch(&url, body).await.map(|_status_code| ())
+    }
+
+    async fn reset_bios(&self) -> Result<(), RedfishError> {
+        let url = format!("Systems/{}/Bios/Actions/Bios.ResetBios", self.s.system_id());
+        let mut arg = HashMap::new();
+        arg.insert("ResetType", "Reset".to_string());
+        self.s.client.post(&url, arg).await.map(|_resp| Ok(()))?
+    }
+
+    async fn machine_setup(
+        &self,
+        _boot_interface_mac: Option<&str>,
+        bios_profiles: &HashMap<
+            RedfishVendor,
+            HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
+        >,
+        selected_profile: BiosProfileType,
+    ) -> Result<(), RedfishError> {
         self.setup_serial_console().await?;
         self.clear_tpm().await?;
         self.boot_first(Boot::Pxe).await?;
         self.set_virt_enable().await?;
         self.set_uefi_boot_only().await?;
-        // non-fatal error because possibly we need a reboot between set_uefi_boot_only and this
-        if let Err(err) = self.set_boot_order_dpu_first(boot_interface_mac).await {
-            tracing::warn!(%err, "libredfish Lenovo set_boot_order_dpu_first");
-        };
-        Ok(())
-    }
-
-    async fn machine_setup_status(&self) -> Result<MachineSetupStatus, RedfishError> {
-        let mut diffs = vec![];
-
-        let sc = self.serial_console_status().await?;
-        if !sc.is_fully_enabled() {
-            diffs.push(MachineSetupDiff {
-                key: "serial_console".to_string(),
-                expected: "Enabled".to_string(),
-                actual: sc.status.to_string(),
-            });
-        }
-
-        // clear_tpm has no 'check' operation, so skip that
-
-        let boot_first = self.s.get_first_boot_option().await?;
-        if boot_first.name != "Network" {
-            // Boot::Pxe maps to lenovo::BootOptionName::Network
-            diffs.push(MachineSetupDiff {
-                key: "boot_first".to_string(),
-                expected: lenovo::BootOptionName::Network.to_string(),
-                actual: boot_first.name.to_string(),
-            });
-        }
-
-        let virt = self.get_virt_enabled().await?;
-        if virt != EnabledDisabled::Enabled {
-            diffs.push(MachineSetupDiff {
-                key: "Processors_IntelVirtualizationTechnology".to_string(),
-                expected: EnabledDisabled::Enabled.to_string(),
-                actual: virt.to_string(),
-            });
-        }
-
-        let bios = self.s.bios_attributes().await?;
-        for (key, expected) in self.uefi_boot_only_attributes() {
-            let Some(actual) = bios.get(key) else {
-                diffs.push(MachineSetupDiff {
-                    key: key.to_string(),
-                    expected: expected.to_string(),
-                    actual: "_missing_".to_string(),
-                });
-                continue;
-            };
-            if actual.as_str().unwrap_or("_wrong_type_") != expected {
-                diffs.push(MachineSetupDiff {
-                    key: key.to_string(),
-                    expected: expected.to_string(),
-                    actual: actual.to_string(),
-                });
+        if let Some(lenovo) = bios_profiles.get(&RedfishVendor::Lenovo) {
+            let model = crate::model_coerce(
+                self.get_system()
+                    .await?
+                    .model
+                    .unwrap_or("".to_string())
+                    .as_str(),
+            );
+            if let Some(all_extra_values) = lenovo.get(&model) {
+                if let Some(extra_values) = all_extra_values.get(&selected_profile) {
+                    tracing::debug!("Setting extra BIOS values: {extra_values:?}");
+                    self.set_bios(extra_values.clone()).await?;
+                }
             }
         }
 
+        Ok(())
+    }
+
+    async fn machine_setup_status(
+        &self,
+        boot_interface_mac: Option<&str>,
+    ) -> Result<MachineSetupStatus, RedfishError> {
+        // Check BIOS and BMC attributes
+        let mut diffs = self.diff_bios_bmc_attr().await?;
+
+        // Check lockdown
         let lockdown = self.lockdown_status().await?;
         if !lockdown.is_fully_enabled() {
             diffs.push(MachineSetupDiff {
@@ -220,6 +263,17 @@ impl Redfish for Bmc {
             });
         }
 
+        // Check the first boot option
+        if let Some(mac) = boot_interface_mac {
+            let (expected, actual) = self.get_expected_and_actual_first_boot_option(mac).await?;
+            if expected.is_none() || expected != actual {
+                diffs.push(MachineSetupDiff {
+                    key: "boot_first".to_string(),
+                    expected: expected.unwrap_or_else(|| "Not found".to_string()),
+                    actual: actual.unwrap_or_else(|| "Not found".to_string()),
+                });
+            }
+        }
         Ok(MachineSetupStatus {
             is_done: diffs.is_empty(),
             diffs,
@@ -559,8 +613,31 @@ impl Redfish for Bmc {
         self.s.get_system().await
     }
 
-    async fn add_secure_boot_certificate(&self, pem_cert: &str) -> Result<Task, RedfishError> {
-        self.s.add_secure_boot_certificate(pem_cert).await
+    async fn get_secure_boot_certificate(
+        &self,
+        database_id: &str,
+        certificate_id: &str,
+    ) -> Result<Certificate, RedfishError> {
+        self.s
+            .get_secure_boot_certificate(database_id, certificate_id)
+            .await
+    }
+
+    async fn get_secure_boot_certificates(
+        &self,
+        database_id: &str,
+    ) -> Result<Vec<String>, RedfishError> {
+        self.s.get_secure_boot_certificates(database_id).await
+    }
+
+    async fn add_secure_boot_certificate(
+        &self,
+        pem_cert: &str,
+        database_id: &str,
+    ) -> Result<Task, RedfishError> {
+        self.s
+            .add_secure_boot_certificate(pem_cert, database_id)
+            .await
     }
 
     async fn get_secure_boot(&self) -> Result<SecureBoot, RedfishError> {
@@ -601,6 +678,10 @@ impl Redfish for Bmc {
         self.s.get_chassis(id).await
     }
 
+    async fn get_chassis_assembly(&self, chassis_id: &str) -> Result<Assembly, RedfishError> {
+        self.s.get_chassis_assembly(chassis_id).await
+    }
+
     async fn get_chassis_network_adapters(
         &self,
         chassis_id: &str,
@@ -631,7 +712,11 @@ impl Redfish for Bmc {
         self.s.get_base_network_adapter(system_id, id).await
     }
 
-    async fn get_ports(&self, chassis_id: &str, network_adapter: &str) -> Result<Vec<String>, RedfishError> {
+    async fn get_ports(
+        &self,
+        chassis_id: &str,
+        network_adapter: &str,
+    ) -> Result<Vec<String>, RedfishError> {
         self.s.get_ports(chassis_id, network_adapter).await
     }
 
@@ -734,45 +819,72 @@ impl Redfish for Bmc {
 
     async fn set_boot_order_dpu_first(
         &self,
-        mac_address: Option<&str>,
-    ) -> Result<(), RedfishError> {
-        let mac = match mac_address {
-            Some(mac) => mac.to_string(),
-            None => {
-                let slot_name = self.dpu_slot().await?;
-                self.slot_mac(&slot_name).await?
-            }
-        };
-
+        mac_address: &str,
+    ) -> Result<Option<String>, RedfishError> {
         // Now we have the MAC, make it the only boot option
+        let mac = mac_address.to_string();
+        // We see three patterns for HTTP IPv4 DPU boot option names in a Lenovo's network boot order:
+        // "UEFI:   SLOT2 (31/0/0) HTTP IPv4  Nvidia Network Adapter - A0:88:C2:08:53:C4",
+        // "UEFI:   SLOT1 (4B/0/0) HTTP IPv4  Mellanox Network Adapter - B8:3F:D2:90:99:C4"
+        // "UEFI:   SLOT 1 (41/0/0) HTTP IPv4  Nvidia BlueField-3 VPI QSFP112 2P 200G PCIe Gen5 x16 - 5C:25:73:79:DA:5C"
+        // This regex pattern uses .*? (non-greedy match) to allow any characters to appear between "Nvidia" and the MAC address.
+        let net_boot_option_pattern = format!("HTTP IPv4  (Mellanox|Nvidia).*? - {}", mac);
+        let net_boot_option_regex =
+            Regex::new(&net_boot_option_pattern).map_err(|err| RedfishError::GenericError {
+                error: format!(
+                    "could not create net_boot_option_regex from {net_boot_option_pattern}: {err}"
+                ),
+            })?;
 
-        let url = format!(
-            "Systems/{}/Oem/Lenovo/BootSettings/BootOrder.NetworkBootOrder",
-            self.s.system_id()
-        );
-        let (_status_code, mut net_boot_order): (_, LenovoBootOrder) =
-            self.s.client.get(&url).await?;
+        // Check boot_order_supported for the list of currently supported boot options.
+        // Set boot_order_next because that's what will happen when we reboot.
+        // boot_order_current is the current order.
+        let mut net_boot_order = self.get_network_boot_order().await?;
+        let dpu_boot_option = net_boot_order
+            .boot_order_supported
+            .iter()
+            .find(|s| net_boot_option_regex.is_match(s))
+            .ok_or_else(|| {
+                RedfishError::MissingBootOption(format!(
+                    "Oem/Lenovo NetworkBootOrder BootOrderSupported {mac} (matching on {net_boot_option_pattern}); currently supported boot options: {:#?}",
+                    net_boot_order.boot_order_supported
+                ))
+            })?;
 
-        // We only check boot_order_next because that's what will happen when we reboot.
-        // boot_order_current has already happened.
-        let maybe_pos = net_boot_order
+        if let Some(pos) = net_boot_order
             .boot_order_next
             .iter()
-            .position(|s: &String| s.to_lowercase().contains(&mac.to_lowercase()));
-        let Some(dpu_pos) = maybe_pos else {
-            return Err(RedfishError::MissingBootOption(format!(
-                "Oem/Lenovo NetworkBootOrder BootOrderNext {mac}"
-            )));
-        };
-        if dpu_pos == 0 {
-            tracing::debug!("DPU will already be the first netboot option after reboot");
-            return Ok(());
+            .position(|s| s == dpu_boot_option)
+        {
+            // the DPU boot option is already at the first index of the boot_order_next list
+            if pos == 0 {
+                tracing::info!(
+                    "NO-OP: DPU ({mac_address}) will already be the first netboot option ({dpu_boot_option}) after reboot"
+                );
+                return Ok(None);
+            } else {
+                // boot_order_next contains the DPU boot option. move it to the front.
+                net_boot_order.boot_order_next.swap(0, pos);
+            }
+        } else {
+            // boot_order_next did not have the DPU boot option. add it to the beginning.
+            net_boot_order
+                .boot_order_next
+                .insert(0, dpu_boot_option.clone());
         }
-        net_boot_order.boot_order_next.swap(0, dpu_pos);
 
         // Patch remote
+        let url = format!(
+            "{}/BootOrder.NetworkBootOrder",
+            self.get_boot_settings_uri()
+        );
         let body = HashMap::from([("BootOrderNext", net_boot_order.boot_order_next.clone())]);
-        self.s.client.patch(&url, body).await.map(|_status_code| ())
+        self.s
+            .client
+            .patch(&url, body)
+            .await
+            .map(|_status_code| ())?;
+        Ok(None)
     }
 
     async fn clear_uefi_password(
@@ -819,9 +931,156 @@ impl Redfish for Bmc {
     async fn clear_nvram(&self) -> Result<(), RedfishError> {
         self.s.clear_nvram().await
     }
+
+    async fn get_nic_mode(&self) -> Result<Option<NicMode>, RedfishError> {
+        self.s.get_nic_mode().await
+    }
+
+    async fn set_nic_mode(&self, mode: NicMode) -> Result<(), RedfishError> {
+        self.s.set_nic_mode(mode).await
+    }
+
+    async fn enable_infinite_boot(&self) -> Result<(), RedfishError> {
+        let attrs: HashMap<String, serde_json::Value> =
+            HashMap::from([("BootModes_InfiniteBootRetry".to_string(), "Enabled".into())]);
+        self.set_bios(attrs).await
+    }
+
+    async fn is_infinite_boot_enabled(&self) -> Result<Option<bool>, RedfishError> {
+        let bios = self.bios().await?;
+        let bios_attributes = match bios.get("Attributes") {
+            Some(attributes) => attributes,
+            None => {
+                return Err(RedfishError::MissingKey {
+                    key: "Attributes".to_owned(),
+                    url: format!("Systems/{}/Bios", self.s.system_id()),
+                })
+            }
+        };
+
+        let infinite_boot_status = bios_attributes
+            .get("BootModes_InfiniteBootRetry")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RedfishError::MissingKey {
+                key: "BootModes_InfiniteBootRetry".to_string(),
+                url: "Bios attributes".to_string(),
+            })?;
+        Ok(Some(
+            infinite_boot_status == EnabledDisabled::Enabled.to_string(),
+        ))
+    }
+
+    async fn set_host_rshim(&self, enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        self.s.set_host_rshim(enabled).await
+    }
+
+    async fn get_host_rshim(&self) -> Result<Option<EnabledDisabled>, RedfishError> {
+        self.s.get_host_rshim().await
+    }
+
+    async fn set_idrac_lockdown(&self, enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        self.s.set_idrac_lockdown(enabled).await
+    }
+
+    async fn get_boss_controller(&self) -> Result<Option<String>, RedfishError> {
+        self.s.get_boss_controller().await
+    }
+
+    async fn decommission_storage_controller(
+        &self,
+        controller_id: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        self.s.decommission_storage_controller(controller_id).await
+    }
+
+    async fn create_storage_volume(
+        &self,
+        controller_id: &str,
+        volume_name: &str,
+        raid_type: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        self.s
+            .create_storage_volume(controller_id, volume_name, raid_type)
+            .await
+    }
+
+    async fn is_boot_order_setup(&self, boot_interface_mac: &str) -> Result<bool, RedfishError> {
+        // Check if Network is first in the boot order
+        let boot_first = self.s.get_first_boot_option().await?;
+        if boot_first.name != "Network" {
+            return Ok(false);
+        }
+
+        // Check if the specific MAC address is first in the network boot order
+        let (expected, actual) = self
+            .get_expected_and_actual_first_boot_option(boot_interface_mac)
+            .await?;
+        Ok(expected.is_some() && expected == actual)
+    }
+
+    async fn is_bios_setup(&self, _boot_interface_mac: Option<&str>) -> Result<bool, RedfishError> {
+        let diffs = self.diff_bios_bmc_attr().await?;
+        Ok(diffs.is_empty())
+    }
 }
 
 impl Bmc {
+    /// Check BIOS and BMC attributes and return differences
+    async fn diff_bios_bmc_attr(&self) -> Result<Vec<MachineSetupDiff>, RedfishError> {
+        let mut diffs = vec![];
+
+        let sc = self.serial_console_status().await?;
+        if !sc.is_fully_enabled() {
+            diffs.push(MachineSetupDiff {
+                key: "serial_console".to_string(),
+                expected: "Enabled".to_string(),
+                actual: sc.status.to_string(),
+            });
+        }
+
+        // clear_tpm has no 'check' operation, so skip that
+
+        let virt = self.get_virt_enabled().await?;
+        if virt != EnabledDisabled::Enabled {
+            diffs.push(MachineSetupDiff {
+                key: "Processors_IntelVirtualizationTechnology".to_string(),
+                expected: EnabledDisabled::Enabled.to_string(),
+                actual: virt.to_string(),
+            });
+        }
+
+        let bios = self.s.bios_attributes().await?;
+        for (key, expected) in self.uefi_boot_only_attributes() {
+            let Some(actual) = bios.get(key) else {
+                diffs.push(MachineSetupDiff {
+                    key: key.to_string(),
+                    expected: expected.to_string(),
+                    actual: "_missing_".to_string(),
+                });
+                continue;
+            };
+            if actual.as_str().unwrap_or("_wrong_type_") != expected {
+                diffs.push(MachineSetupDiff {
+                    key: key.to_string(),
+                    expected: expected.to_string(),
+                    actual: actual.to_string(),
+                });
+            }
+        }
+
+        let boot_first = self.s.get_first_boot_option().await?;
+        if boot_first.name != "Network" {
+            // Boot::Pxe maps to lenovo::BootOptionName::Network
+            diffs.push(MachineSetupDiff {
+                key: "boot_first_type".to_string(),
+                expected: lenovo::BootOptionName::Network.to_string(),
+                actual: boot_first.name.to_string(),
+            });
+        }
+
+        Ok(diffs)
+    }
+
     /// Lock a Lenovo server to make it ready for tenants
     async fn enable_lockdown(&self) -> Result<(), RedfishError> {
         self.set_kcs_lenovo(false).await.inspect_err(|err| {
@@ -926,7 +1185,7 @@ impl Bmc {
             v => {
                 return Err(RedfishError::InvalidValue {
                     url: format!("Managers/{}", self.s.manager_id()),
-                    field: format!("KCS"),
+                    field: "KCS".to_string(),
                     err: InvalidValueError(format!(
                         "expected bool or string as KCS enabled value type; got {v}"
                     )),
@@ -1303,73 +1562,107 @@ impl Bmc {
         Ok(log_entries)
     }
 
-    // The name of the PCIe slot the DPU is in, usually "Slot15"
-    async fn dpu_slot(&self) -> Result<String, RedfishError> {
-        let pcie_devices = self.pcie_devices().await?;
-        for device in pcie_devices {
-            if device.slot.is_none()
-                || device.pcie_functions.is_none()
-                || device.slot.as_ref().unwrap().location.is_none()
-            {
-                // we won't be able to locate it in the BIOS without a slot
-                // we won't be able to identify it as a DPU without pcie_functions
-                continue;
-            }
-            let pcie_functions: ResourceCollection<PCIeFunction> = self
-                .get_collection(device.pcie_functions.unwrap())
-                .await
-                .and_then(|r| r.try_get())?;
-            if pcie_functions.members.iter().any(|p| p.is_dpu()) {
-                // We found it
-                // Safety: we checked slot.is_none() and location.is_none() at start of loop
-                if let Some(pl) = &device
-                    .slot
-                    .as_ref()
-                    .unwrap()
-                    .location
-                    .as_ref()
-                    .unwrap()
-                    .part_location
-                {
-                    if let Some(loc_type) = pl.location_type.as_ref() {
-                        if let Some(ord_val) = pl.location_ordinal_value {
-                            let bios_slot_name = format!("{loc_type}{ord_val}");
-                            return Ok(bios_slot_name);
-                        }
-                    }
-                }
-            }
+    async fn is_lenovo_sr_675_v3_ovx(&self) -> Result<bool, RedfishError> {
+        let system = self.get_system().await?;
+        match system.sku {
+            /*  7D9RCTOLWW is the SKU for Lenovo ThinkSystem SR675 V3 OVX
+                Taken from sample redfish response against an SR675 in AZ51:
+                curl -k -D - --user root:'password' -H 'Content-Type: application/json' -X GET https://10.91.48.100:443/redfish/v1/Systems/1
+                {..."SKU":"7D9RCTOLWW","PowerState":"On"...}
+            */
+            Some(sku) => Ok(sku == "7D9RCTOLWW"),
+            None => Err(RedfishError::MissingKey {
+                key: "sku".to_string(),
+                url: "Systems".to_string(),
+            }),
         }
-        Err(RedfishError::NoDpu)
     }
 
-    // The MAC address for a specific PCIeDevice slot. The slot name must look like "Slot15",
-    // get it with `dpu_slot()`.
-    // We are looking for a BIOS entry like this:
-    // "MellanoxNetworkAdapter_A088C2C36F6E__Slot15_MACAddress"
-    // That is the only currently known way to match a PCIeDevice slot to a MAC.
-    async fn slot_mac(&self, slot_name: &str) -> Result<String, RedfishError> {
-        let slot_mac_suffix = format!("{slot_name}_MACAddress");
-        let bios_attrs = self.s.bios_attributes().await?;
-        let Some(attrs_map) = bios_attrs.as_object() else {
-            return Err(RedfishError::InvalidKeyType {
-                key: "Attributes".to_string(),
-                expected_type: "Map".to_string(),
-                url: String::new(),
-            });
-        };
-        match attrs_map.keys().find(|k| k.ends_with(&slot_mac_suffix)) {
-            None => Err(RedfishError::MissingBootOption(format!(
-                "No BIOS entry ending '{slot_mac_suffix}'"
-            ))),
-            Some(key) => Ok(attrs_map
-                .get(key)
-                .unwrap()
-                .as_str() // json::Value -> &str
-                .unwrap_or_default()
-                .trim_matches('"')
-                .to_string()),
+    async fn get_bmc_version(&self) -> Result<String, RedfishError> {
+        let uefi_fw_info = self.get_firmware("BMC-Primary").await?;
+        Ok(uefi_fw_info.version.unwrap_or_default())
+    }
+
+    async fn get_uefi_version(&self) -> Result<String, RedfishError> {
+        let uefi_fw_info = self.get_firmware("UEFI").await?;
+        Ok(uefi_fw_info.version.unwrap_or_default())
+    }
+
+    async fn use_workaround_for_force_restart(&self) -> Result<bool, RedfishError> {
+        if self.is_lenovo_sr_675_v3_ovx().await? {
+            let uefi_version = self.get_uefi_version().await?;
+            let bmc_version = self.get_bmc_version().await?;
+
+            let is_uefi_at_7_10 = version_compare::compare(uefi_version, "7.10")
+                .is_ok_and(|c| c == version_compare::Cmp::Eq);
+
+            let is_bmc_at_9_10 = version_compare::compare(bmc_version, "9.10")
+                .is_ok_and(|c| c == version_compare::Cmp::Eq);
+
+            if is_uefi_at_7_10 && is_bmc_at_9_10 {
+                return Ok(true);
+            }
         }
+
+        Ok(false)
+    }
+
+    fn get_boot_settings_uri(&self) -> String {
+        format!("Systems/{}/Oem/Lenovo/BootSettings", self.s.system_id())
+    }
+
+    async fn get_network_boot_order(&self) -> Result<LenovoBootOrder, RedfishError> {
+        let url = self.get_boot_settings_uri();
+        let (_status_code, boot_settings): (_, BootSettings) = self.s.client.get(&url).await?;
+        for member in &boot_settings.members {
+            let id = member.odata_id_get()?;
+            if id.contains("BootOrder.NetworkBootOrder") {
+                let (_status_code, net_boot_order): (_, LenovoBootOrder) =
+                    self.s.client.get(&format!("{url}/{id}")).await?;
+
+                return Ok(net_boot_order);
+            }
+        }
+
+        Err(RedfishError::GenericError {
+            error: format!(
+                "Could not find the NetworkBootOrder out of Boot Settings members: {:#?}",
+                boot_settings.members
+            ),
+        })
+    }
+
+    async fn get_expected_and_actual_first_boot_option(
+        &self,
+        boot_interface_mac: &str,
+    ) -> Result<(Option<String>, Option<String>), RedfishError> {
+        let mac = boot_interface_mac.to_string();
+        // We see three patterns for HTTP IPv4 DPU boot option names in a Lenovo's network boot order:
+        // "UEFI:   SLOT2 (31/0/0) HTTP IPv4  Nvidia Network Adapter - A0:88:C2:08:53:C4",
+        // "UEFI:   SLOT1 (4B/0/0) HTTP IPv4  Mellanox Network Adapter - B8:3F:D2:90:99:C4"
+        // "UEFI:   SLOT 1 (41/0/0) HTTP IPv4  Nvidia BlueField-3 VPI QSFP112 2P 200G PCIe Gen5 x16 - 5C:25:73:79:DA:5C"
+        // This regex pattern uses .*? (non-greedy match) to allow any characters to appear between "Nvidia" and the MAC address.
+        let net_boot_option_pattern = format!("HTTP IPv4  (Mellanox|Nvidia).*? - {}", mac);
+        let net_boot_option_regex =
+            Regex::new(&net_boot_option_pattern).map_err(|err| RedfishError::GenericError {
+                error: format!(
+                    "could not create net_boot_option_regex from {net_boot_option_pattern}: {err}"
+                ),
+            })?;
+
+        // Check boot_order_supported for the list of currently supported boot options.
+        // Set boot_order_next because that's what will happen when we reboot.
+        // boot_order_current is the current order.
+        let net_boot_order = self.get_network_boot_order().await?;
+        let expected_first_boot_option = net_boot_order
+            .boot_order_supported
+            .iter()
+            .find(|s| net_boot_option_regex.is_match(s))
+            .cloned();
+
+        let actual_first_boot_option = net_boot_order.boot_order_next.first().cloned();
+
+        Ok((expected_first_boot_option, actual_first_boot_option))
     }
 }
 

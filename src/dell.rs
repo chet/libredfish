@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,20 +24,25 @@ use std::{collections::HashMap, path::Path, time::Duration};
 
 use reqwest::{header::HeaderMap, Method};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::fs::File;
 
 use crate::{
     model::{
         account_service::ManagerAccount,
-        chassis::{Chassis, NetworkAdapter},
+        certificate::Certificate,
+        chassis::{Assembly, Chassis, NetworkAdapter},
         network_device_function::NetworkDeviceFunction,
-        oem::dell::{self, ShareParameters, SystemConfiguration},
+        oem::{
+            dell::{self, ShareParameters, StorageCollection, SystemConfiguration},
+            nvidia_dpu::NicMode,
+        },
         power::Power,
         resource::ResourceCollection,
         secure_boot::SecureBoot,
         sel::{LogEntry, LogEntryCollection},
         sensor::GPUSensors,
-        service_root::ServiceRoot,
+        service_root::{RedfishVendor, ServiceRoot},
         software_inventory::SoftwareInventory,
         storage::Drives,
         task::Task,
@@ -46,23 +51,14 @@ use crate::{
         BootOption, ComputerSystem, InvalidValueError, Manager, OnOff,
     },
     standard::RedfishStandard,
-    Boot, BootOptions, Collection, EnabledDisabled, MachineSetupDiff, MachineSetupStatus, JobState,
-    ODataId, PCIeDevice, PowerState, Redfish, RedfishError, Resource, RoleId, Status,
-    StatusInternal, SystemPowerControl,
+    BiosProfileType, Boot, BootOptions, Collection, EnabledDisabled, JobState, MachineSetupDiff,
+    MachineSetupStatus, ODataId, PCIeDevice, PowerState, Redfish, RedfishError, Resource, RoleId,
+    Status, StatusInternal, SystemPowerControl,
 };
 
 const UEFI_PASSWORD_NAME: &str = "SetupPassword";
 
 const MAX_ACCOUNT_ID: u8 = 16;
-
-const MELLANOX_DELL_VENDOR_ID: &str = "15b3";
-const MELLANOX_DELL_DPU_DEVICE_IDS: [&str; 5] = [
-    "a2df", // BF3 Family integrated network controller [BlueField-3 integrated network controller]
-    "a2d9", // MT43162 BlueField-3 Lx integrated ConnectX-7 network controller
-    "a2dc", // MT43244 BlueField-3 integrated ConnectX-7 network controller
-    "a2d2", // MT416842 BlueField integrated ConnectX-5 network controller
-    "a2d6", // MT42822 BlueField-2 integrated ConnectX-6 Dx network controller
-];
 
 pub struct Bmc {
     s: RedfishStandard,
@@ -104,6 +100,10 @@ impl Redfish for Bmc {
             .await
     }
 
+    async fn delete_user(&self, username: &str) -> Result<(), RedfishError> {
+        self.s.delete_user(username).await
+    }
+
     async fn change_username(&self, old_name: &str, new_name: &str) -> Result<(), RedfishError> {
         self.s.change_username(old_name, new_name).await
     }
@@ -133,7 +133,27 @@ impl Redfish for Bmc {
     }
 
     async fn power(&self, action: SystemPowerControl) -> Result<(), RedfishError> {
-        self.s.power(action).await
+        if action == SystemPowerControl::ACPowercycle {
+            let is_lockdown = self.is_lockdown().await?;
+            let bios_attrs = self.s.bios_attributes().await?;
+            let uefi_var_access = bios_attrs
+                .get("UefiVariableAccess")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if is_lockdown || uefi_var_access == "Controlled" {
+                return Err(RedfishError::GenericError {
+                    error: "Cannot perform AC power cycle while system is locked down. Disable lockdown, reboot, verify BIOS attribute 'UefiVariableAccess' is 'Standard', and then try again.".to_string(),
+                });
+            }
+            self.perform_ac_power_cycle().await
+        } else {
+            self.s.power(action).await
+        }
+    }
+
+    fn ac_powercycle_supported_by_power(&self) -> bool {
+        true
     }
 
     async fn bmc_reset(&self) -> Result<(), RedfishError> {
@@ -164,6 +184,14 @@ impl Redfish for Bmc {
         self.get_system_event_log().await
     }
 
+    async fn get_bmc_event_log(
+        &self,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<LogEntry>, RedfishError> {
+        // Different Dell timestamp formats (UTC-5, DST, etc..) are making filtering and comparing very difficult
+        self.s.get_bmc_event_log(from).await
+    }
+
     async fn get_drives_metrics(&self) -> Result<Vec<Drives>, RedfishError> {
         self.s.get_drives_metrics().await
     }
@@ -172,67 +200,93 @@ impl Redfish for Bmc {
         self.s.bios().await
     }
 
+    async fn set_bios(
+        &self,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Result<(), RedfishError> {
+        let apply_time = dell::SetSettingsApplyTime {
+            apply_time: dell::RedfishSettingsApplyTime::OnReset, // requires reboot to apply
+        };
+
+        let set_attrs = dell::GenericSetBiosAttrs {
+            redfish_settings_apply_time: apply_time,
+            attributes: values,
+        };
+
+        let url = format!("Systems/{}/Bios/Settings/", self.s.system_id());
+        self.s
+            .client
+            .patch(&url, set_attrs)
+            .await
+            .map(|_status_code| ())
+    }
+
+    async fn reset_bios(&self) -> Result<(), RedfishError> {
+        self.s.factory_reset_bios().await
+    }
+
     async fn get_base_mac_address(&self) -> Result<Option<String>, RedfishError> {
         self.s.get_base_mac_address().await
     }
 
-    async fn machine_setup(&self, boot_interface_mac: Option<&str>) -> Result<(), RedfishError> {
+    async fn machine_setup(
+        &self,
+        boot_interface_mac: Option<&str>,
+        bios_profiles: &HashMap<
+            RedfishVendor,
+            HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
+        >,
+        selected_profile: BiosProfileType,
+    ) -> Result<(), RedfishError> {
         self.delete_job_queue().await?;
 
         let apply_time = dell::SetSettingsApplyTime {
             apply_time: dell::RedfishSettingsApplyTime::OnReset, // requires reboot to apply
         };
 
-        // Find the DPU
-        let mut has_dpu = true;
-        let nic_slot = match self.dpu_nic_slot(boot_interface_mac).await {
-            Ok(slot) => slot,
-            Err(RedfishError::NoDpu) => {
-                has_dpu = false;
-                "".to_string()
+        let (nic_slot, has_dpu) = match boot_interface_mac {
+            Some(mac) => {
+                let slot: String = self.dpu_nic_slot(mac).await?;
+                (slot, true)
             }
-            Err(err) => {
-                return Err(err);
-            }
+            // Zero-DPU case
+            None => ("".to_string(), false),
         };
 
         // dell idrac requires applying all bios settings at once.
-        let machine_settings = self.machine_setup_attrs(&nic_slot);
+        let machine_settings = self.machine_setup_attrs(&nic_slot).await?;
         let set_machine_attrs = dell::SetBiosAttrs {
             redfish_settings_apply_time: apply_time,
             attributes: machine_settings,
         };
+        // Convert to a more generic HashMap to allow merging with the extra BIOS values
+        let as_json =
+            serde_json::to_string(&set_machine_attrs).map_err(|e| RedfishError::GenericError {
+                error: { e.to_string() },
+            })?;
+        let mut set_machine_attrs: HashMap<String, serde_json::Value> =
+            serde_json::from_str(as_json.as_str()).map_err(|e| RedfishError::GenericError {
+                error: { e.to_string() },
+            })?;
+        if let Some(dell) = bios_profiles.get(&RedfishVendor::Dell) {
+            let model = crate::model_coerce(
+                self.get_system()
+                    .await?
+                    .model
+                    .unwrap_or("".to_string())
+                    .as_str(),
+            );
+            if let Some(all_extra_values) = dell.get(&model) {
+                if let Some(extra_values) = all_extra_values.get(&selected_profile) {
+                    tracing::debug!("Setting extra BIOS values: {extra_values:?}");
+                    set_machine_attrs.extend(extra_values.clone());
+                }
+            }
+        }
 
         let url = format!("Systems/{}/Bios/Settings/", self.s.system_id());
         match self.s.client.patch(&url, set_machine_attrs).await? {
-            (_, Some(headers)) => {
-                let key = "location";
-                // return the job_id to the caller in the future
-                // for now, make sure to return an error if a BIOS config job is not created
-                let _job_id = headers
-                    .get(key)
-                    .ok_or_else(|| RedfishError::MissingKey {
-                        key: key.to_string(),
-                        url: url.to_string(),
-                    })?
-                    .to_str()
-                    .map_err(|e| RedfishError::InvalidValue {
-                        url: url.to_string(),
-                        field: key.to_string(),
-                        err: InvalidValueError(e.to_string()),
-                    })?
-                    .split('/')
-                    .last()
-                    .ok_or_else(|| RedfishError::InvalidValue {
-                        url: url.to_string(),
-                        field: key.to_string(),
-                        err: InvalidValueError(
-                            "unable to parse job_id from location string".to_string(),
-                        ),
-                    })?
-                    .to_string();
-                Ok(())
-            }
+            (_, Some(headers)) => self.parse_job_id_from_response_headers(&url, headers).await,
             (_, None) => Err(RedfishError::NoHeader),
         }?;
 
@@ -248,134 +302,14 @@ impl Redfish for Bmc {
         }
     }
 
-    async fn machine_setup_status(&self) -> Result<MachineSetupStatus, RedfishError> {
-        let mut diffs = vec![];
+    async fn machine_setup_status(
+        &self,
+        boot_interface_mac: Option<&str>,
+    ) -> Result<MachineSetupStatus, RedfishError> {
+        // Check BIOS and BMC attributes
+        let mut diffs = self.diff_bios_bmc_attr(boot_interface_mac).await?;
 
-        let bios = self.s.bios_attributes().await?;
-        let nic_slot = self.dpu_nic_slot(None).await?;
-        let mut expected_attrs = self.machine_setup_attrs(&nic_slot);
-
-        expected_attrs.tpm2_hierarchy = dell::Tpm2HierarchySettings::Enabled;
-
-        macro_rules! diff {
-            ($key:literal, $exp:expr, $act:ty) => {
-                let key = $key;
-                let exp = $exp;
-                let Some(act_v) = bios.get(key) else {
-                    return Err(RedfishError::MissingKey {
-                        key: key.to_string(),
-                        url: "bios".to_string(),
-                    });
-                };
-                let act =
-                    <$act>::deserialize(act_v).map_err(|e| RedfishError::JsonDeserializeError {
-                        url: "bios".to_string(),
-                        body: act_v.to_string(),
-                        source: e,
-                    })?;
-                if exp != act {
-                    diffs.push(MachineSetupDiff {
-                        key: key.to_string(),
-                        expected: exp.to_string(),
-                        actual: act.to_string(),
-                    });
-                }
-            };
-        }
-
-        diff!(
-            "InBandManageabilityInterface",
-            expected_attrs.in_band_manageability_interface,
-            EnabledDisabled
-        );
-        diff!(
-            "UefiVariableAccess",
-            expected_attrs.uefi_variable_access,
-            dell::UefiVariableAccessSettings
-        );
-        diff!(
-            "SerialComm",
-            expected_attrs.serial_comm,
-            dell::SerialCommSettings
-        );
-        diff!(
-            "SerialPortAddress",
-            expected_attrs.serial_port_address,
-            dell::SerialPortSettings
-        );
-        diff!("FailSafeBaud", expected_attrs.fail_safe_baud, String);
-        diff!(
-            "ConTermType",
-            expected_attrs.con_term_type,
-            dell::SerialPortTermSettings
-        );
-        diff!(
-            "RedirAfterBoot",
-            expected_attrs.redir_after_boot,
-            EnabledDisabled
-        );
-        diff!(
-            "SriovGlobalEnable",
-            expected_attrs.sriov_global_enable,
-            EnabledDisabled
-        );
-        diff!("TpmSecurity", expected_attrs.tpm_security, OnOff);
-        diff!(
-            "Tpm2Hierarchy",
-            expected_attrs.tpm2_hierarchy,
-            dell::Tpm2HierarchySettings
-        );
-        diff!(
-            "Tpm2Algorithm",
-            expected_attrs.tpm2_algorithm,
-            dell::Tpm2Algorithm
-        );
-        diff!(
-            "HttpDev1EnDis",
-            expected_attrs.http_device_1_enabled_disabled,
-            EnabledDisabled
-        );
-        diff!(
-            "PxeDev1EnDis",
-            expected_attrs.pxe_device_1_enabled_disabled,
-            EnabledDisabled
-        );
-        diff!(
-            "HttpDev1Interface",
-            expected_attrs.http_device_1_interface,
-            String
-        );
-
-        let manager_attrs = self.manager_dell_oem_attributes().await?;
-        let expected = HashMap::from([
-            ("WebServer.1.HostHeaderCheck", "Disabled"),
-            ("IPMILan.1.Enable", "Enabled"),
-        ]);
-        for (key, exp) in expected {
-            let Some(act) = manager_attrs.get(key) else {
-                return Err(RedfishError::MissingKey {
-                    key: key.to_string(),
-                    url: "Managers/{manager_id}/Oem/Dell/DellAttributes/{manager_id}".to_string(),
-                });
-            };
-            if act != exp {
-                diffs.push(MachineSetupDiff {
-                    key: key.to_string(),
-                    expected: exp.to_string(),
-                    actual: act.to_string(),
-                });
-            }
-        }
-
-        let bmc_remote_access = self.bmc_remote_access_status().await?;
-        if !bmc_remote_access.is_fully_enabled() {
-            diffs.push(MachineSetupDiff {
-                key: "bmc_remote_access".to_string(),
-                expected: "Enabled".to_string(),
-                actual: bmc_remote_access.status.to_string(),
-            });
-        }
-
+        // Check lockdown
         let lockdown = self.lockdown_status().await?;
         if !lockdown.is_fully_enabled() {
             diffs.push(MachineSetupDiff {
@@ -383,6 +317,18 @@ impl Redfish for Bmc {
                 expected: "Enabled".to_string(),
                 actual: lockdown.status.to_string(),
             });
+        }
+
+        // Check the first boot option
+        if let Some(mac) = boot_interface_mac {
+            let (expected, actual) = self.get_expected_and_actual_first_boot_option(mac).await?;
+            if expected.is_none() || expected != actual {
+                diffs.push(MachineSetupDiff {
+                    key: "boot_first".to_string(),
+                    expected: expected.unwrap_or_else(|| "Not found".to_string()),
+                    actual: actual.unwrap_or_else(|| "Not found".to_string()),
+                });
+            }
         }
 
         Ok(MachineSetupStatus {
@@ -405,13 +351,19 @@ impl Redfish for Bmc {
 
     async fn lockdown(&self, target: EnabledDisabled) -> Result<(), RedfishError> {
         use EnabledDisabled::*;
+        // XE9680's can't PXE boot for some reason
+        let system = self.s.get_system().await?;
+        let entry = match system.model.as_deref() {
+            Some("PowerEdge XE9680") => dell::BootDevices::UefiHttp,
+            _ => dell::BootDevices::PXE,
+        };
         match target {
             Enabled => {
                 //self.enable_bios_lockdown().await?;
-                self.enable_bmc_lockdown(dell::BootDevices::PXE).await
+                self.enable_bmc_lockdown(entry).await
             }
             Disabled => {
-                self.disable_bmc_lockdown(dell::BootDevices::PXE).await?;
+                self.disable_bmc_lockdown(entry).await?;
                 // BIOS lockdown blocks impi, ensure it's disabled even though we never set it
                 self.disable_bios_lockdown().await
             }
@@ -422,24 +374,6 @@ impl Redfish for Bmc {
         let mut message = String::new();
         let enabled = EnabledDisabled::Enabled.to_string();
         let disabled = EnabledDisabled::Disabled.to_string();
-
-        // BIOS lockdown
-        let url = format!("Systems/{}/Bios", self.s.system_id());
-        let (_status_code, bios): (_, dell::Bios) = self.s.client.get(&url).await?;
-
-        let in_band = bios
-            .attributes
-            .in_band_manageability_interface
-            .unwrap_or_default();
-        let uefi_var = bios.attributes.uefi_variable_access.unwrap_or_default();
-        message.push_str(&format!(
-            "BIOS: in_band_manageability_interface={in_band}, uefi_variable_access={uefi_var}. "
-        ));
-
-        let is_bios_locked = in_band == disabled
-            && uefi_var == dell::UefiVariableAccessSettings::Controlled.to_string();
-        let is_bios_unlocked = in_band == enabled
-            && uefi_var == dell::UefiVariableAccessSettings::Standard.to_string();
 
         // BMC lockdown
 
@@ -482,9 +416,9 @@ impl Redfish for Bmc {
 
         Ok(Status {
             message,
-            status: if is_bios_locked && is_bmc_locked {
+            status: if is_bmc_locked {
                 StatusInternal::Enabled
-            } else if is_bios_unlocked && is_bmc_unlocked {
+            } else if is_bmc_unlocked {
                 StatusInternal::Disabled
             } else {
                 StatusInternal::Partial
@@ -676,8 +610,31 @@ impl Redfish for Bmc {
         self.s.get_system().await
     }
 
-    async fn add_secure_boot_certificate(&self, pem_cert: &str) -> Result<Task, RedfishError> {
-        self.s.add_secure_boot_certificate(pem_cert).await
+    async fn get_secure_boot_certificate(
+        &self,
+        database_id: &str,
+        certificate_id: &str,
+    ) -> Result<Certificate, RedfishError> {
+        self.s
+            .get_secure_boot_certificate(database_id, certificate_id)
+            .await
+    }
+
+    async fn get_secure_boot_certificates(
+        &self,
+        database_id: &str,
+    ) -> Result<Vec<String>, RedfishError> {
+        self.s.get_secure_boot_certificates(database_id).await
+    }
+
+    async fn add_secure_boot_certificate(
+        &self,
+        pem_cert: &str,
+        database_id: &str,
+    ) -> Result<Task, RedfishError> {
+        self.s
+            .add_secure_boot_certificate(pem_cert, database_id)
+            .await
     }
 
     async fn get_secure_boot(&self) -> Result<SecureBoot, RedfishError> {
@@ -726,6 +683,10 @@ impl Redfish for Bmc {
         self.s.get_chassis(id).await
     }
 
+    async fn get_chassis_assembly(&self, chassis_id: &str) -> Result<Assembly, RedfishError> {
+        self.s.get_chassis_assembly(chassis_id).await
+    }
+
     async fn get_chassis_network_adapters(
         &self,
         chassis_id: &str,
@@ -756,7 +717,11 @@ impl Redfish for Bmc {
         self.s.get_base_network_adapter(system_id, id).await
     }
 
-    async fn get_ports(&self, chassis_id: &str, network_adapter: &str) -> Result<Vec<String>, RedfishError> {
+    async fn get_ports(
+        &self,
+        chassis_id: &str,
+        network_adapter: &str,
+    ) -> Result<Vec<String>, RedfishError> {
         self.s.get_ports(chassis_id, network_adapter).await
     }
 
@@ -836,21 +801,67 @@ impl Redfish for Bmc {
         let url = format!("Managers/iDRAC.Embedded.1/Jobs/{}", job_id);
         let (_status_code, body): (_, HashMap<String, serde_json::Value>) =
             self.s.client.get(&url).await?;
-        let key = "JobState";
-        let val = body
-            .get(key)
+        let job_state_key = "JobState";
+        let job_state_value = body
+            .get(job_state_key)
             .ok_or_else(|| RedfishError::MissingKey {
-                key: key.to_string(),
+                key: job_state_key.to_string(),
                 url: url.to_string(),
             })?
             .as_str()
             .ok_or_else(|| RedfishError::InvalidKeyType {
-                key: key.to_string(),
+                key: job_state_key.to_string(),
                 expected_type: "&str".to_string(),
                 url: url.to_string(),
             })?;
 
-        Ok(JobState::from_str(val))
+        let job_state = match JobState::from_str(job_state_value) {
+            JobState::Scheduled => {
+                let message_key = "Message";
+                let message_value = body
+                    .get(message_key)
+                    .ok_or_else(|| RedfishError::MissingKey {
+                        key: message_key.to_string(),
+                        url: url.to_string(),
+                    })?
+                    .as_str()
+                    .ok_or_else(|| RedfishError::InvalidKeyType {
+                        key: message_key.to_string(),
+                        expected_type: "&str".to_string(),
+                        url: url.to_string(),
+                    })?;
+                match message_value {
+                    /* Example JSON response body for a job that is Scheduled but will never complete: the job remains stuck in a Scheduled state indefinitely.
+                    {
+                        "@odata.context": "/redfish/v1/$metadata#DellJob.DellJob",
+                        "@odata.id": "/redfish/v1/Managers/iDRAC.Embedded.1/Oem/Dell/Jobs/JID_510613515077",
+                        "@odata.type": "#DellJob.v1_5_0.DellJob",
+                        "ActualRunningStartTime": null,
+                        "ActualRunningStopTime": null,
+                        "CompletionTime": null,
+                        "Description": "Job Instance",
+                        "EndTime": "TIME_NA",
+                        "Id": "JID_510613515077",
+                        "JobState": "Scheduled",
+                        "JobType": "RAIDConfiguration",
+                        "Message": "Job processing initialization failure.",
+                        "MessageArgs": [],
+                        "MessageArgs@odata.count": 0,
+                        "MessageId": "PR30",
+                        "Name": "Configure: BOSS.SL.16-1",
+                        "PercentComplete": 1,
+                        "StartTime": "2025-06-27T16:55:51",
+                        "TargetSettingsURI": null
+                    }
+                    */
+                    "Job processing initialization failure." => JobState::ScheduledWithErrors,
+                    _ => JobState::Scheduled,
+                }
+            }
+            state => state,
+        };
+
+        Ok(job_state)
     }
 
     async fn get_collection(&self, id: ODataId) -> Result<Collection, RedfishError> {
@@ -861,13 +872,43 @@ impl Redfish for Bmc {
         self.s.get_resource(id).await
     }
 
-    // machine_setup does this, but Dell requires all attributes to be sent at once so
-    // we do not support doing just this part, on a Dell.
+    // set_boot_order_dpu_first configures the boot order on the Dell to set the HTTP boot
+    // option that corresponds to the primary DPU as the first boot option in the list.
     async fn set_boot_order_dpu_first(
         &self,
-        _mac_address: Option<&str>,
-    ) -> Result<(), RedfishError> {
-        Err(RedfishError::UnnecessaryOperation)
+        boot_interface_mac: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        let expected_boot_option_name: String = self
+            .get_expected_dpu_boot_option_name(boot_interface_mac)
+            .await?;
+        let boot_order = self.get_boot_order().await?;
+        for (idx, boot_option) in boot_order.iter().enumerate() {
+            if boot_option.display_name == expected_boot_option_name {
+                if idx == 0 {
+                    // Dells will not generate a bios config job below if the boot orders already configured correctly
+                    tracing::info!(
+                        "NO-OP: DPU ({boot_interface_mac}) will already be the first netboot option ({expected_boot_option_name}) after reboot"
+                    );
+                    return Ok(None);
+                }
+
+                let url = format!("Systems/{}", self.s.system_id());
+                let body = HashMap::from([(
+                    "Boot",
+                    HashMap::from([("BootOrder", vec![boot_option.id.clone()])]),
+                )]);
+
+                let job_id = match self.s.client.patch(&url, body).await? {
+                    (_, Some(headers)) => {
+                        self.parse_job_id_from_response_headers(&url, headers).await
+                    }
+                    (_, None) => Err(RedfishError::NoHeader),
+                }?;
+                return Ok(Some(job_id));
+            }
+        }
+
+        return Err(RedfishError::MissingBootOption(expected_boot_option_name));
     }
 
     async fn clear_uefi_password(
@@ -880,9 +921,17 @@ impl Redfish for Bmc {
 
     async fn lockdown_bmc(&self, target: crate::EnabledDisabled) -> Result<(), RedfishError> {
         use EnabledDisabled::*;
+
+        // XE9680's can't PXE boot for some reason
+        let system = self.s.get_system().await?;
+        let entry = match system.model.as_deref() {
+            Some("PowerEdge XE9680") => dell::BootDevices::UefiHttp,
+            _ => dell::BootDevices::PXE,
+        };
+
         match target {
-            Enabled => self.enable_bmc_lockdown(dell::BootDevices::PXE).await,
-            Disabled => self.disable_bmc_lockdown(dell::BootDevices::PXE).await,
+            Enabled => self.enable_bmc_lockdown(entry).await,
+            Disabled => self.disable_bmc_lockdown(entry).await,
         }
     }
 
@@ -915,12 +964,285 @@ impl Redfish for Bmc {
     async fn clear_nvram(&self) -> Result<(), RedfishError> {
         self.s.clear_nvram().await
     }
+
+    async fn get_nic_mode(&self) -> Result<Option<NicMode>, RedfishError> {
+        self.s.get_nic_mode().await
+    }
+
+    async fn set_nic_mode(&self, mode: NicMode) -> Result<(), RedfishError> {
+        self.s.set_nic_mode(mode).await
+    }
+
+    async fn enable_infinite_boot(&self) -> Result<(), RedfishError> {
+        let attrs: HashMap<String, serde_json::Value> =
+            HashMap::from([("BootSeqRetry".to_string(), "Enabled".into())]);
+        self.set_bios(attrs).await
+    }
+
+    async fn is_infinite_boot_enabled(&self) -> Result<Option<bool>, RedfishError> {
+        let bios = self.bios().await?;
+        let bios_attributes = match bios.get("Attributes") {
+            Some(attributes) => attributes,
+            None => {
+                return Err(RedfishError::MissingKey {
+                    key: "Attributes".to_owned(),
+                    url: format!("Systems/{}/Bios", self.s.system_id()),
+                })
+            }
+        };
+
+        let infinite_boot_status = bios_attributes
+            .get("BootSeqRetry")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RedfishError::MissingKey {
+                key: "BootSeqRetry".to_string(),
+                url: "Bios attributes".to_string(),
+            })?;
+
+        Ok(Some(
+            infinite_boot_status == EnabledDisabled::Enabled.to_string(),
+        ))
+    }
+
+    async fn set_host_rshim(&self, enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        self.s.set_host_rshim(enabled).await
+    }
+
+    async fn get_host_rshim(&self) -> Result<Option<EnabledDisabled>, RedfishError> {
+        self.s.get_host_rshim().await
+    }
+
+    async fn set_idrac_lockdown(&self, enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        self.set_idrac_lockdown(enabled).await
+    }
+
+    async fn get_boss_controller(&self) -> Result<Option<String>, RedfishError> {
+        self.get_boss_controller().await
+    }
+
+    async fn decommission_storage_controller(
+        &self,
+        controller_id: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        Ok(Some(self.decommission_controller(controller_id).await?))
+    }
+
+    async fn create_storage_volume(
+        &self,
+        controller_id: &str,
+        volume_name: &str,
+        raid_type: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        let drives = self.get_storage_drives(controller_id).await?;
+        Ok(Some(
+            self.create_storage_volume(controller_id, volume_name, raid_type, drives)
+                .await?,
+        ))
+    }
+
+    async fn is_boot_order_setup(&self, boot_interface_mac: &str) -> Result<bool, RedfishError> {
+        let (expected, actual) = self
+            .get_expected_and_actual_first_boot_option(boot_interface_mac)
+            .await?;
+        Ok(expected.is_some() && expected == actual)
+    }
+
+    async fn is_bios_setup(&self, boot_interface_mac: Option<&str>) -> Result<bool, RedfishError> {
+        let diffs = self.diff_bios_bmc_attr(boot_interface_mac).await?;
+        Ok(diffs.is_empty())
+    }
 }
 
 impl Bmc {
     pub fn new(s: RedfishStandard) -> Result<Bmc, RedfishError> {
         Ok(Bmc { s })
     }
+
+    /// Check BIOS and BMC attributes and return differences
+    async fn diff_bios_bmc_attr(
+        &self,
+        boot_interface_mac: Option<&str>,
+    ) -> Result<Vec<MachineSetupDiff>, RedfishError> {
+        let mut diffs = vec![];
+
+        let bios = self.s.bios_attributes().await?;
+        let nic_slot = match boot_interface_mac {
+            Some(mac) => self.dpu_nic_slot(mac).await?,
+            None => "".to_string(),
+        };
+
+        let mut expected_attrs = self.machine_setup_attrs(&nic_slot).await?;
+
+        expected_attrs.tpm2_hierarchy = dell::Tpm2HierarchySettings::Enabled;
+
+        macro_rules! diff {
+            ($key:literal, $exp:expr, $act:ty) => {
+                let key = $key;
+                let exp = $exp;
+                let Some(act_v) = bios.get(key) else {
+                    return Err(RedfishError::MissingKey {
+                        key: key.to_string(),
+                        url: "bios".to_string(),
+                    });
+                };
+                let act =
+                    <$act>::deserialize(act_v).map_err(|e| RedfishError::JsonDeserializeError {
+                        url: "bios".to_string(),
+                        body: act_v.to_string(),
+                        source: e,
+                    })?;
+                if exp != act {
+                    diffs.push(MachineSetupDiff {
+                        key: key.to_string(),
+                        expected: exp.to_string(),
+                        actual: act.to_string(),
+                    });
+                }
+            };
+        }
+
+        diff!(
+            "InBandManageabilityInterface",
+            expected_attrs.in_band_manageability_interface,
+            EnabledDisabled
+        );
+        diff!(
+            "UefiVariableAccess",
+            expected_attrs.uefi_variable_access,
+            dell::UefiVariableAccessSettings
+        );
+        diff!(
+            "SerialComm",
+            expected_attrs.serial_comm,
+            dell::SerialCommSettings
+        );
+        diff!(
+            "SerialPortAddress",
+            expected_attrs.serial_port_address,
+            dell::SerialPortSettings
+        );
+        diff!("FailSafeBaud", expected_attrs.fail_safe_baud, String);
+        diff!(
+            "ConTermType",
+            expected_attrs.con_term_type,
+            dell::SerialPortTermSettings
+        );
+        diff!(
+            "RedirAfterBoot",
+            expected_attrs.redir_after_boot,
+            EnabledDisabled
+        );
+        diff!(
+            "SriovGlobalEnable",
+            expected_attrs.sriov_global_enable,
+            EnabledDisabled
+        );
+        diff!("TpmSecurity", expected_attrs.tpm_security, OnOff);
+        diff!(
+            "Tpm2Hierarchy",
+            expected_attrs.tpm2_hierarchy,
+            dell::Tpm2HierarchySettings
+        );
+        diff!(
+            "Tpm2Algorithm",
+            expected_attrs.tpm2_algorithm,
+            dell::Tpm2Algorithm
+        );
+        diff!(
+            "HttpDev1EnDis",
+            expected_attrs.http_device_1_enabled_disabled,
+            EnabledDisabled
+        );
+        diff!(
+            "PxeDev1EnDis",
+            expected_attrs.pxe_device_1_enabled_disabled,
+            EnabledDisabled
+        );
+        diff!(
+            "HttpDev1Interface",
+            expected_attrs.http_device_1_interface,
+            String
+        );
+
+        let manager_attrs = self.manager_dell_oem_attributes().await?;
+        let expected = HashMap::from([
+            ("WebServer.1.HostHeaderCheck", "Disabled"),
+            ("IPMILan.1.Enable", "Enabled"),
+            ("OS-BMC.1.AdminState", "Disabled"),
+        ]);
+        for (key, exp) in expected {
+            let Some(act) = manager_attrs.get(key) else {
+                return Err(RedfishError::MissingKey {
+                    key: key.to_string(),
+                    url: "Managers/{manager_id}/Oem/Dell/DellAttributes/{manager_id}".to_string(),
+                });
+            };
+            if act != exp {
+                diffs.push(MachineSetupDiff {
+                    key: key.to_string(),
+                    expected: exp.to_string(),
+                    actual: act.to_string(),
+                });
+            }
+        }
+
+        let bmc_remote_access = self.bmc_remote_access_status().await?;
+        if !bmc_remote_access.is_fully_enabled() {
+            diffs.push(MachineSetupDiff {
+                key: "bmc_remote_access".to_string(),
+                expected: "Enabled".to_string(),
+                actual: bmc_remote_access.status.to_string(),
+            });
+        }
+
+        Ok(diffs)
+    }
+
+    async fn perform_ac_power_cycle(&self) -> Result<(), RedfishError> {
+        self.clear_pending().await?;
+
+        // Set PowerCycleRequest in BIOS settings
+        let apply_time = dell::SetSettingsApplyTime {
+            apply_time: dell::RedfishSettingsApplyTime::OnReset,
+        };
+
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "PowerCycleRequest".to_string(),
+            serde_json::Value::String("FullPowerCycle".to_string()),
+        );
+
+        let set_attrs = dell::GenericSetBiosAttrs {
+            redfish_settings_apply_time: apply_time,
+            attributes,
+        };
+
+        let url = format!("Systems/{}/Bios/Settings", self.s.system_id());
+        let result = self.s.client.patch(&url, set_attrs).await;
+
+        // Handle intermittent 400 errors for read-only attributes
+        if let Err(RedfishError::HTTPErrorCode {
+            status_code,
+            response_body,
+            ..
+        }) = &result
+        {
+            if status_code.as_u16() == 400 && response_body.contains("read-only") {
+                return Err(RedfishError::GenericError {
+                    error: "Failed to set PowerCycleRequest BIOS attribute due to read-only dependencies. Please reboot the machine and try again.".to_string(),
+                });
+            }
+        }
+        result?;
+
+        // Apply the setting based on current power state
+        let current_power_state = self.s.get_power_state().await?;
+        match current_power_state {
+            PowerState::Off => self.s.power(SystemPowerControl::On).await,
+            _ => self.s.power(SystemPowerControl::GracefulRestart).await,
+        }
+    }
+
     // No changes can be applied if there are pending jobs
     async fn delete_job_queue(&self) -> Result<(), RedfishError> {
         // The queue can't be cleared if system lockdown is enabled
@@ -990,6 +1312,23 @@ impl Bmc {
             .map(|_status_code| ())
     }
 
+    async fn set_idrac_lockdown(&self, enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        let manager_id: &str = self.s.manager_id();
+        let url = format!("Managers/{manager_id}/Attributes/");
+
+        let mut lockdown = HashMap::new();
+        lockdown.insert("Lockdown.1.SystemLockdown", enabled.to_string());
+
+        let mut attributes = HashMap::new();
+        attributes.insert("Attributes", lockdown);
+
+        self.s
+            .client
+            .patch(&url, attributes)
+            .await
+            .map(|_status_code| ())
+    }
+
     async fn enable_bmc_lockdown(&self, entry: dell::BootDevices) -> Result<(), RedfishError> {
         let apply_time = dell::SetSettingsApplyTime {
             apply_time: dell::RedfishSettingsApplyTime::OnReset,
@@ -1048,11 +1387,24 @@ impl Bmc {
             attributes: lockdown,
         };
         let url = format!("Systems/{}/Bios/Settings/", self.s.system_id());
-        self.s
+        // Sometimes, these settings are read only.  Ignore those errors trying to set them.
+        let ret = self
+            .s
             .client
             .patch(&url, set_lockdown_attrs)
             .await
-            .map(|_status_code| ())
+            .map(|_status_code| ());
+        if let Err(RedfishError::HTTPErrorCode {
+            url: _,
+            status_code,
+            response_body,
+        }) = &ret
+        {
+            if status_code.as_u16() == 400 && response_body.contains("read-only") {
+                return Ok(());
+            }
+        }
+        ret
     }
 
     async fn disable_bmc_lockdown(&self, entry: dell::BootDevices) -> Result<(), RedfishError> {
@@ -1296,22 +1648,22 @@ impl Bmc {
     ) -> Result<(serde_json::Map<String, serde_json::Value>, String), RedfishError> {
         let manager_id = self.s.manager_id();
         let url = &format!("Managers/{manager_id}/Oem/Dell/DellAttributes/{manager_id}");
-        let (_status_code, body): (_, HashMap<String, serde_json::Value>) =
+        let (_status_code, mut body): (_, HashMap<String, serde_json::Value>) =
             self.s.client.get(url).await?;
         let key = "Attributes";
-        let v = body
-            .get(key)
-            .ok_or_else(|| RedfishError::MissingKey {
-                key: key.to_string(),
-                url: url.to_string(),
-            })?
-            .as_object()
-            .ok_or_else(|| RedfishError::InvalidKeyType {
-                key: key.to_string(),
-                expected_type: "Object".to_string(),
-                url: url.to_string(),
-            })
-            .cloned()?;
+        let v = match body.remove(key).ok_or_else(|| RedfishError::MissingKey {
+            key: key.to_string(),
+            url: url.to_string(),
+        })? {
+            serde_json::Value::Object(obj) => obj,
+            _ => {
+                return Err(RedfishError::InvalidKeyType {
+                    key: key.to_string(),
+                    expected_type: "Object".to_string(),
+                    url: url.to_string(),
+                });
+            }
+        };
         Ok((v, url.to_string()))
     }
 
@@ -1399,39 +1751,36 @@ impl Bmc {
         );
 
         match self.s.client.post(url, arg).await? {
-            (_, Some(headers)) => {
-                let key = "location";
-                Ok(headers
-                    .get(key)
-                    .ok_or_else(|| RedfishError::MissingKey {
-                        key: key.to_string(),
-                        url: url.to_string(),
-                    })?
-                    .to_str()
-                    .map_err(|e| RedfishError::InvalidValue {
-                        url: url.to_string(),
-                        field: key.to_string(),
-                        err: InvalidValueError(e.to_string()),
-                    })?
-                    .split('/')
-                    .last()
-                    .ok_or_else(|| RedfishError::InvalidValue {
-                        url: url.to_string(),
-                        field: key.to_string(),
-                        err: InvalidValueError(
-                            "unable to parse job_id from location string".to_string(),
-                        ),
-                    })?
-                    .to_string())
-            }
+            (_, Some(headers)) => self.parse_job_id_from_response_headers(url, headers).await,
             (_, None) => Err(RedfishError::NoHeader),
         }
     }
 
-    fn machine_setup_attrs(&self, nic_slot: &str) -> dell::MachineBiosAttrs {
-        dell::MachineBiosAttrs {
+    async fn machine_setup_attrs(
+        &self,
+        nic_slot: &str,
+    ) -> Result<dell::MachineBiosAttrs, RedfishError> {
+        let curr_bios_attributes = self.s.bios_attributes().await?;
+        let curr_enabled_boot_options = match curr_bios_attributes.get("SetBootOrderEn") {
+            Some(enabled_boot_options) => enabled_boot_options.as_str().unwrap_or_default(),
+            None => {
+                return Err(RedfishError::MissingKey {
+                    key: "SetBootOrderEn".to_owned(),
+                    url: format!("Systems/{}/Bios", self.s.system_id()),
+                });
+            }
+        };
+
+        // We want to disable all boot options other than HTTP Device 1.
+        let boot_options_to_disable_arr: Vec<&str> = curr_enabled_boot_options
+            .split(",")
+            .filter(|boot_option| boot_option.as_ref() != "NIC.HttpDevice.1-1".to_string())
+            .collect();
+        let boot_options_to_disable_str = boot_options_to_disable_arr.join(",");
+
+        Ok(dell::MachineBiosAttrs {
             in_band_manageability_interface: EnabledDisabled::Disabled,
-            uefi_variable_access: dell::UefiVariableAccessSettings::Controlled,
+            uefi_variable_access: dell::UefiVariableAccessSettings::Standard,
             serial_comm: dell::SerialCommSettings::OnConRedir,
             serial_port_address: dell::SerialPortSettings::Com1,
             fail_safe_baud: "115200".to_string(),
@@ -1447,7 +1796,8 @@ impl Bmc {
             http_device_1_interface: nic_slot.to_string(),
             set_boot_order_en: nic_slot.to_string(),
             http_device_1_tls_mode: dell::TlsMode::None,
-        }
+            set_boot_order_dis: boot_options_to_disable_str,
+        })
     }
 
     /// Dells endpoint to change the UEFI password has a bug for updating it once it is set.
@@ -1468,6 +1818,34 @@ impl Bmc {
         };
 
         self.import_system_configuration(system_configuration).await
+    }
+
+    async fn parse_job_id_from_response_headers(
+        &self,
+        url: &str,
+        resp_headers: HeaderMap,
+    ) -> Result<String, RedfishError> {
+        let key = "location";
+        Ok(resp_headers
+            .get(key)
+            .ok_or_else(|| RedfishError::MissingKey {
+                key: key.to_string(),
+                url: url.to_string(),
+            })?
+            .to_str()
+            .map_err(|e| RedfishError::InvalidValue {
+                url: url.to_string(),
+                field: key.to_string(),
+                err: InvalidValueError(e.to_string()),
+            })?
+            .split('/')
+            .last()
+            .ok_or_else(|| RedfishError::InvalidValue {
+                url: url.to_string(),
+                field: key.to_string(),
+                err: InvalidValueError("unable to parse job_id from location string".to_string()),
+            })?
+            .to_string())
     }
 
     /// import_system_configuration returns the job ID for importing this sytem configuration
@@ -1494,37 +1872,15 @@ impl Bmc {
             .await?;
 
         match resp_headers {
-            Some(headers) => {
-                let key = "location";
-                Ok(headers
-                    .get(key)
-                    .ok_or_else(|| RedfishError::MissingKey {
-                        key: key.to_string(),
-                        url: url.to_string(),
-                    })?
-                    .to_str()
-                    .map_err(|e| RedfishError::InvalidValue {
-                        url: url.to_string(),
-                        field: key.to_string(),
-                        err: InvalidValueError(e.to_string()),
-                    })?
-                    .split('/')
-                    .last()
-                    .ok_or_else(|| RedfishError::InvalidValue {
-                        url: url.to_string(),
-                        field: key.to_string(),
-                        err: InvalidValueError(
-                            "unable to parse job_id from location string".to_string(),
-                        ),
-                    })?
-                    .to_string())
-            }
+            Some(headers) => self.parse_job_id_from_response_headers(url, headers).await,
             None => Err(RedfishError::NoHeader),
         }
     }
 
-    // Returns a string like "NIC.Slot.5-1"
-    async fn dpu_nic_slot(&self, mac_address: Option<&str>) -> Result<String, RedfishError> {
+    async fn get_dpu_nw_device_function(
+        &self,
+        boot_interface_mac_address: &str,
+    ) -> Result<NetworkDeviceFunction, RedfishError> {
         let chassis = self.get_chassis(self.s.system_id()).await?;
         let na_id = match chassis.network_adapters {
             Some(id) => id,
@@ -1558,73 +1914,235 @@ impl Bmc {
                 .and_then(|r| r.try_get())?;
 
             for nw_dev_func in rc_nw_func.members {
-                if mac_address.is_some() && nw_dev_func.ethernet.is_none() {
-                    // can match on a MAC the interface doesn't report
-                    continue;
-                }
-                if mac_address.is_none() && nw_dev_func.oem.is_none() {
-                    // The vendor and device ids are in the OEM section
-                    continue;
-                }
-                let oem = nw_dev_func.oem.unwrap();
-                let Some(oem_dell) = oem.get("Dell") else {
-                    continue;
-                };
-                let Some(oem_dell_map) = oem_dell.as_object() else {
-                    continue;
-                };
-                let Some(dell_nic) = oem_dell_map.get("DellNIC") else {
-                    continue;
-                };
-                let Some(dell_nic) = dell_nic.as_object() else {
-                    continue;
-                };
-                let Some(nic_slot) = dell_nic
-                    .get("Id")
-                    .and_then(|id| id.as_str())
-                    .map(|id| id.to_string())
-                else {
-                    continue;
-                };
-                match mac_address {
-                    // Caller wants to match a specific MAC address
-                    Some(want_mac) => {
-                        if nw_dev_func
-                            .ethernet
-                            .unwrap()
-                            .mac_address
-                            .map(|x| x.to_lowercase())
-                            .as_deref()
-                            == Some(&want_mac.to_lowercase())
-                        {
-                            // we found a match by MAC address
-                            return Ok(nic_slot);
-                        }
-                    }
-                    // Caller wants the first DPU
-                    None => {
-                        let Some(vendor_id) =
-                            dell_nic.get("PCIVendorID").and_then(|vid| vid.as_str())
-                        else {
-                            continue;
-                        };
-                        let Some(device_id) =
-                            dell_nic.get("PCIDeviceID").and_then(|did| did.as_str())
-                        else {
-                            continue;
-                        };
-                        if vendor_id == MELLANOX_DELL_VENDOR_ID
-                            && MELLANOX_DELL_DPU_DEVICE_IDS.contains(&device_id)
-                        {
-                            // we found a match by vendor and device id address
-                            return Ok(nic_slot);
+                if let Some(ref ethernet_info) = nw_dev_func.ethernet {
+                    if let Some(ref mac) = ethernet_info.mac_address {
+                        let standardized_mac = mac.to_lowercase();
+                        if standardized_mac == boot_interface_mac_address.to_lowercase() {
+                            return Ok(nw_dev_func);
                         }
                     }
                 }
             }
         }
 
-        Err(RedfishError::NoDpu)
+        Err(RedfishError::GenericError {
+            error: format!(
+                "could not find network device function for {boot_interface_mac_address}"
+            ),
+        })
+    }
+
+    async fn get_dell_nic_info(
+        &self,
+        mac_address: &str,
+    ) -> Result<serde_json::Map<String, Value>, RedfishError> {
+        let nw_device_function = self.get_dpu_nw_device_function(mac_address).await?;
+
+        let oem = nw_device_function
+            .oem
+            .ok_or_else(|| RedfishError::GenericError {
+                error: "OEM information is missing".to_string(),
+            })?;
+
+        let oem_dell = oem.get("Dell").ok_or_else(|| RedfishError::GenericError {
+            error: "Dell OEM information is missing".to_string(),
+        })?;
+
+        let oem_dell_map = oem_dell
+            .as_object()
+            .ok_or_else(|| RedfishError::GenericError {
+                error: "Dell OEM information is not a valid object".to_string(),
+            })?;
+
+        let dell_nic_map = oem_dell_map
+            .get("DellNIC")
+            .and_then(|dell_nic| dell_nic.as_object())
+            .ok_or_else(|| RedfishError::GenericError {
+                error: "DellNIC information is not a valid object or is missing".to_string(),
+            })?;
+
+        Ok(dell_nic_map.to_owned())
+    }
+
+    // Returns a string like "NIC.Slot.5-1"
+    async fn dpu_nic_slot(&self, mac_address: &str) -> Result<String, RedfishError> {
+        let dell_nic_info = self.get_dell_nic_info(mac_address).await?;
+
+        let nic_slot = dell_nic_info
+            .get("Id")
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| RedfishError::GenericError {
+                error: "NIC slot ID is missing or not a valid string".to_string(),
+            })?
+            .to_string();
+
+        Ok(nic_slot)
+    }
+
+    async fn get_boss_controller(&self) -> Result<Option<String>, RedfishError> {
+        let url: String = format!("Systems/System.Embedded.1/Storage");
+        let (_status_code, storage_collection): (_, StorageCollection) =
+            self.s.client.get(&url).await?;
+        for controller in storage_collection.members {
+            if controller.odata_id.contains("BOSS") {
+                let boss_controller_id =
+                    controller.odata_id.split('/').last().ok_or_else(|| {
+                        RedfishError::InvalidValue {
+                            url: url.to_string(),
+                            field: "odata_id".to_string(),
+                            err: InvalidValueError(format!(
+                                "unable to parse boss_controller_id from {}",
+                                controller.odata_id
+                            )),
+                        }
+                    })?;
+                return Ok(Some(boss_controller_id.to_string()));
+            }
+        }
+
+        return Ok(None);
+    }
+
+    async fn decommission_controller(&self, controller_id: &str) -> Result<String, RedfishError> {
+        // wait for the lifecycle controller status to become Ready before decomissioning the boss controller
+        // https://github.com/dell/idrac-Redfish-Scripting/issues/323
+        self.lifecycle_controller_is_ready().await?;
+
+        let url: String = format!("Systems/System.Embedded.1/Storage/{controller_id}/Actions/Oem/DellStorage.ControllerDrivesDecommission");
+        let mut arg = HashMap::new();
+        arg.insert("@Redfish.OperationApplyTime", "Immediate");
+
+        match self.s.client.post(&url, arg).await? {
+            (_, Some(headers)) => self.parse_job_id_from_response_headers(&url, headers).await,
+            (_, None) => Err(RedfishError::NoHeader),
+        }
+    }
+
+    async fn get_storage_drives(&self, controller_id: &str) -> Result<Value, RedfishError> {
+        let url = format!("Systems/System.Embedded.1/Storage/{controller_id}");
+        let (_status_code, body): (_, HashMap<String, serde_json::Value>) =
+            self.s.client.get(&url).await?;
+
+        let key = "Drives";
+        body.get(key)
+            .ok_or_else(|| RedfishError::MissingKey {
+                key: key.to_string(),
+                url: url.to_string(),
+            })
+            .cloned()
+    }
+
+    async fn create_storage_volume(
+        &self,
+        controller_id: &str,
+        volume_name: &str,
+        raid_type: &str,
+        drive_info: Value,
+    ) -> Result<String, RedfishError> {
+        if volume_name.len() > 15 || volume_name.len() < 1 {
+            return Err(RedfishError::GenericError {
+                error: format!(
+                    "invalid volume name ({volume_name}); must be between 1 and 15 characters long"
+                ),
+            });
+        }
+
+        // wait for the lifecycle controller status to become Ready
+        self.lifecycle_controller_is_ready().await?;
+
+        let url: String = format!("Systems/System.Embedded.1/Storage/{controller_id}/Volumes");
+        let mut arg = HashMap::new();
+
+        arg.insert("Name", Value::String(volume_name.to_string()));
+        arg.insert("RAIDType", Value::String(raid_type.to_string()));
+        arg.insert("Drives", drive_info);
+
+        match self.s.client.post(&url, arg).await? {
+            (_, Some(headers)) => self.parse_job_id_from_response_headers(&url, headers).await,
+            (_, None) => Err(RedfishError::NoHeader),
+        }
+    }
+
+    async fn get_lifecycle_controller_status(&self) -> Result<String, RedfishError> {
+        let url = format!(
+            "Dell/Managers/{}/DellLCService/Actions/DellLCService.GetRemoteServicesAPIStatus",
+            self.s.manager_id()
+        );
+        let arg: HashMap<&'static str, Value> = HashMap::new();
+        let (_status_code, resp_body, _resp_headers): (
+            _,
+            Option<HashMap<String, serde_json::Value>>,
+            Option<HeaderMap>,
+        ) = self
+            .s
+            .client
+            .req(Method::POST, &url, Some(arg), None, None, Vec::new())
+            .await?;
+
+        let lc_status = match resp_body.unwrap_or_default().get("LCStatus") {
+            Some(status) => status.as_str().unwrap_or_default().to_string(),
+            None => todo!(),
+        };
+
+        Ok(lc_status)
+    }
+
+    async fn lifecycle_controller_is_ready(&self) -> Result<(), RedfishError> {
+        let lc_status = self.get_lifecycle_controller_status().await?;
+        if lc_status == "Ready" {
+            return Ok(());
+        }
+
+        Err(RedfishError::GenericError { error: format!("the lifecycle controller is not ready to accept provisioning requests; lc_status: {lc_status}") })
+    }
+
+    // get_expected_dpu_boot_option_name assumes that assumes that the HTTP Device One boot option has been enabled
+    // and points to the NIC for the boot interface MAC address. In the future, we can relax the string matching if
+    // we configure other HTTP devices and just match on the NIC's device description.
+    async fn get_expected_dpu_boot_option_name(
+        &self,
+        boot_interface_mac: &str,
+    ) -> Result<String, RedfishError> {
+        let dell_nic_info = self.get_dell_nic_info(boot_interface_mac).await?;
+
+        let device_description = dell_nic_info
+            .get("DeviceDescription")
+            .and_then(|device_description| device_description.as_str())
+            .ok_or_else(|| RedfishError::GenericError {
+                error: format!("the NIC Device Description for {boot_interface_mac} is missing or not a valid string").to_string(),
+            })?
+            .to_string();
+
+        Ok(format!("HTTP Device 1: {device_description}",))
+    }
+
+    async fn get_boot_order(&self) -> Result<Vec<BootOption>, RedfishError> {
+        let boot_options = self.get_boot_options().await?;
+        let mut boot_order: Vec<BootOption> = Vec::new();
+        for (_, boot_option) in boot_options.members.iter().enumerate() {
+            let id = boot_option.odata_id_get()?;
+            let boot_option = self.get_boot_option(id).await?;
+            boot_order.push(boot_option)
+        }
+
+        Ok(boot_order)
+    }
+
+    // get_expected_and_actual_first_boot_option assumes that the HTTP Device One boot option has been enabled
+    // and points to the NIC for the boot interface MAC address. In the future, we can relax the string matching if
+    // we configure other HTTP devices and just match on the NIC's device description.
+    async fn get_expected_and_actual_first_boot_option(
+        &self,
+        boot_interface_mac: &str,
+    ) -> Result<(Option<String>, Option<String>), RedfishError> {
+        let expected_first_boot_option = Some(
+            self.get_expected_dpu_boot_option_name(boot_interface_mac)
+                .await?,
+        );
+        let boot_order = self.get_boot_order().await?;
+        let actual_first_boot_option = boot_order.first().map(|opt| opt.display_name.clone());
+
+        Ok((expected_first_boot_option, actual_first_boot_option))
     }
 }
 

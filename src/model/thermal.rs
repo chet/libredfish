@@ -1,5 +1,4 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -23,8 +22,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{ODataLinks, ResourceStatus, StatusVec};
-use crate::model::ODataId;
 use crate::model::sensor::Sensor;
+use crate::model::ODataId;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
@@ -137,20 +136,19 @@ impl Default for Temperature {
 impl From<TemperatureOemNvidia> for Temperature {
     fn from(temp: TemperatureOemNvidia) -> Self {
         Self {
-                name: temp.device_name.unwrap_or("Unknown".to_string()),
-                reading_celsius: temp.reading,
-                physical_context: temp.physical_context,
-                ..Default::default()
-            }
+            name: temp.device_name.unwrap_or("Unknown".to_string()),
+            reading_celsius: temp.reading,
+            physical_context: temp.physical_context,
+            ..Default::default()
+        }
     }
 }
 
 impl From<Sensor> for Temperature {
     fn from(sensor: Sensor) -> Self {
-        let physical_context = match sensor.physical_context {
-            Some(physical_context) => Some(physical_context.to_string()),
-            None => None,
-        };
+        let physical_context = sensor
+            .physical_context
+            .map(|physical_context| physical_context.to_string());
         Self {
             name: sensor.name.unwrap_or("".to_string()),
             sensor_number: None,

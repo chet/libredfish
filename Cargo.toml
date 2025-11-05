@@ -1,10 +1,13 @@
 [package]
 name = "libredfish"
 description = "A redfish library. Useful for querying server hardware from a BMC."
-authors = ["Chris Holcombe <xfactor973@gmail.com>", "NVIDIA Engineering"]
-repository = "https://github.com/nvidia/libredfish"
+authors = [
+  "NVIDIA Engineering <noemail@nvidia.com>",
+  "Chris Holcombe <xfactor973@gmail.com>",
+]
+repository = "https://github.com/NVIDIA/libredfish"
 license = "MIT"
-version = "0.27.2"
+version = "0.31.3"
 edition = "2021"
 
 [dependencies]
@@ -26,6 +29,8 @@ tokio = { version = "1", features = ["full"], registry = "cratesio" }
 tracing = { version = "0.1", registry = "cratesio" }
 version-compare = { version = "0.1", registry = "cratesio" }
 regex = "1.10"
+chrono = "0.4.34"
+urlencoding = "2.1.3"
 
 [dev-dependencies]
 anyhow = { version = "1", registry = "cratesio" }

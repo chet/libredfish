@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +58,62 @@ pub enum HostPrivilegeLevel {
 }
 
 impl fmt::Display for HostPrivilegeLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+/// This OEM specific extension is mainly applicable for querying chassis information for the ERoT subsystem
+/// odata_type is always present regardless of the subsystem we are querying for (Bluefield_BMC, Bluefield_ERoT, or Card1)
+/// the remaining attributes are only present when querying the Bluefield_ERoT
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct Chassis {
+    #[serde(rename = "@odata.type")]
+    pub odata_type: String,
+    pub automatic_background_copy_enabled: Option<bool>,
+    pub background_copy_status: Option<BackgroundCopyStatus>,
+    pub inband_update_policy_enabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
+pub enum BackgroundCopyStatus {
+    InProgress,
+    Completed,
+}
+
+impl fmt::Display for BackgroundCopyStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum NicMode {
+    #[serde(rename = "DpuMode", alias = "Dpu")]
+    Dpu,
+    #[serde(rename = "NicMode", alias = "Nic")]
+    Nic,
+}
+
+impl FromStr for NicMode {
+    type Err = ();
+
+    fn from_str(input: &str) -> Result<NicMode, Self::Err> {
+        // strip quotes from the string
+        let normalized_input = input.replace('"', "");
+        if normalized_input == "NicMode".to_string() {
+            Ok(NicMode::Nic)
+        } else if normalized_input == "DpuMode".to_string() {
+            Ok(NicMode::Dpu)
+        } else {
+            Err(())
+        }
+    }
+}
+
+impl fmt::Display for NicMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }

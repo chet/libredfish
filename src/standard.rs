@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -20,25 +20,21 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
-use std::{
-    collections::{HashMap, HashSet},
-    default,
-    path::Path,
-    time::Duration,
-};
+use std::{collections::HashMap, default, path::Path, time::Duration};
 
 use reqwest::{header::HeaderName, Method, StatusCode};
 use serde_json::json;
 use tracing::debug;
 
-use crate::model::job::Job;
-use crate::model::serial_interface::SerialInterface;
+use crate::model::certificate::Certificate;
+use crate::model::chassis::Assembly;
 use crate::model::service_root::ServiceRoot;
 use crate::model::software_inventory::SoftwareInventory;
 use crate::model::task::Task;
 use crate::model::thermal::Thermal;
 use crate::model::update_service::ComponentType;
 use crate::model::{account_service::ManagerAccount, service_root::RedfishVendor};
+use crate::model::{job::Job, oem::nvidia_dpu::NicMode};
 use crate::model::{
     manager_network_protocol::ManagerNetworkProtocol, update_service::TransferProtocolType,
 };
@@ -46,11 +42,12 @@ use crate::model::{power, thermal, BootOption, InvalidValueError, Manager, Manag
 use crate::model::{power::Power, update_service::UpdateService};
 use crate::model::{secure_boot::SecureBoot, sensor::GPUSensors};
 use crate::model::{sel::LogEntry, ManagerResetType};
-use crate::model::{storage::Drives, storage::Storage, storage::StorageSubsystem};
+use crate::model::{sel::LogEntryCollection, serial_interface::SerialInterface};
+use crate::model::{storage::Drives, storage::Storage};
 use crate::network::{RedfishHttpClient, REDFISH_ENDPOINT};
 use crate::{
-    model, Boot, EnabledDisabled, JobState, NetworkDeviceFunction, NetworkPort, PowerState,
-    Redfish, RoleId, Status, Systems,
+    model, BiosProfileType, Boot, EnabledDisabled, JobState, NetworkDeviceFunction, NetworkPort,
+    PowerState, Redfish, RoleId, Status, Systems,
 };
 use crate::{
     model::chassis::{Chassis, NetworkAdapter},
@@ -88,6 +85,11 @@ impl Redfish for RedfishStandard {
             .map(|_resp| Ok(()))?
     }
 
+    async fn delete_user(&self, username: &str) -> Result<(), RedfishError> {
+        let url = format!("AccountService/Accounts/{}", username);
+        self.client.delete(&url).await.map(|_status_code| Ok(()))?
+    }
+
     async fn change_username(&self, old_name: &str, new_name: &str) -> Result<(), RedfishError> {
         let account = self.get_account_by_name(old_name).await?;
         let Some(account_id) = account.id else {
@@ -122,19 +124,29 @@ impl Redfish for RedfishStandard {
         let url = format!("AccountService/Accounts/{}", account_id);
         let mut data = HashMap::new();
         data.insert("Password", new_pass);
-        self.client
-            .patch(&url, &data)
-            .await
-            .map(|_status_code| Ok(()))?
+        let service_root = self.get_service_root().await?;
+        if service_root.vendor() == Some(RedfishVendor::AMI) {
+            self.client.patch_with_if_match(&url, &data).await
+        } else {
+            self.client
+                .patch(&url, &data)
+                .await
+                .map(|_status_code| Ok(()))?
+        }
     }
 
     async fn get_accounts(&self) -> Result<Vec<ManagerAccount>, RedfishError> {
-        let account_ids = self.get_members("AccountService/Accounts").await?;
-        let mut accounts = Vec::with_capacity(account_ids.len());
-        for id in account_ids {
-            let account = self.get_account_by_id(&id).await?;
-            accounts.push(account);
-        }
+        let mut accounts: Vec<ManagerAccount> = self
+            .get_collection(ODataId {
+                odata_id: "/redfish/v1/AccountService/Accounts".into(),
+            })
+            .await
+            .and_then(|c| c.try_get::<ManagerAccount>())
+            .into_iter()
+            .flat_map(|rc| rc.members)
+            .map(Into::into)
+            .collect();
+
         accounts.sort();
         Ok(accounts)
     }
@@ -150,11 +162,20 @@ impl Redfish for RedfishStandard {
     }
 
     async fn power(&self, action: model::SystemPowerControl) -> Result<(), RedfishError> {
+        if action == model::SystemPowerControl::ACPowercycle {
+            return Err(RedfishError::NotSupported(
+                "AC power cycle not supported on this platform".to_string(),
+            ));
+        }
         let url = format!("Systems/{}/Actions/ComputerSystem.Reset", self.system_id);
         let mut arg = HashMap::new();
         arg.insert("ResetType", action.to_string());
         // Lenovo: The expected HTTP response code is 204 No Content
         self.client.post(&url, arg).await.map(|_resp| Ok(()))?
+    }
+
+    fn ac_powercycle_supported_by_power(&self) -> bool {
+        false
     }
 
     async fn bmc_reset(&self) -> Result<(), RedfishError> {
@@ -189,15 +210,36 @@ impl Redfish for RedfishStandard {
         Err(RedfishError::NotSupported("SEL".to_string()))
     }
 
+    async fn get_bmc_event_log(
+        &self,
+        _from: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<LogEntry>, RedfishError> {
+        Err(RedfishError::NotSupported("BMC Event Log".to_string()))
+    }
+
     async fn get_drives_metrics(&self) -> Result<Vec<Drives>, RedfishError> {
-        let drives = self.get_drives_metrics().await?;
-        Ok(drives)
+        self.get_drives_metrics().await
     }
 
     async fn bios(&self) -> Result<HashMap<String, serde_json::Value>, RedfishError> {
         let url = format!("Systems/{}/Bios", self.system_id());
         let (_status_code, body) = self.client.get(&url).await?;
         Ok(body)
+    }
+
+    async fn set_bios(
+        &self,
+        _values: HashMap<String, serde_json::Value>,
+    ) -> Result<(), RedfishError> {
+        Err(RedfishError::NotSupported(
+            "set_bios is vendor specific and not available on this platform".to_string(),
+        ))
+    }
+
+    async fn reset_bios(&self) -> Result<(), RedfishError> {
+        Err(RedfishError::NotSupported(
+            "reset_bios is vendor specific and not available on this platform".to_string(),
+        ))
     }
 
     async fn pending(&self) -> Result<HashMap<String, serde_json::Value>, RedfishError> {
@@ -210,12 +252,25 @@ impl Redfish for RedfishStandard {
         self.clear_pending_with_url(&url).await
     }
 
-    async fn machine_setup(&self, _boot_interface_mac: Option<&str>) -> Result<(), RedfishError> {
+    async fn machine_setup(
+        &self,
+        _boot_interface_mac: Option<&str>,
+        _bios_profiles: &HashMap<
+            RedfishVendor,
+            HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
+        >,
+        _selected_profile: BiosProfileType,
+    ) -> Result<(), RedfishError> {
         Err(RedfishError::NotSupported("machine_setup".to_string()))
     }
 
-    async fn machine_setup_status(&self) -> Result<MachineSetupStatus, RedfishError> {
-        Err(RedfishError::NotSupported("machine_setup_status".to_string()))
+    async fn machine_setup_status(
+        &self,
+        _boot_interface_mac: Option<&str>,
+    ) -> Result<MachineSetupStatus, RedfishError> {
+        Err(RedfishError::NotSupported(
+            "machine_setup_status".to_string(),
+        ))
     }
 
     async fn set_machine_password_policy(&self) -> Result<(), RedfishError> {
@@ -274,27 +329,8 @@ impl Redfish for RedfishStandard {
     }
 
     async fn pcie_devices(&self) -> Result<Vec<PCIeDevice>, RedfishError> {
-        let mut out = Vec::new();
-        let mut seen = HashSet::new(); // Dell redfish response has duplicates
-        let system = self.get_system().await?;
-        debug!("Listing {} PCIe devices..", system.pcie_devices.len());
-        for member in system.pcie_devices {
-            let url = member
-                .odata_id
-                .replace(&format!("/{REDFISH_ENDPOINT}/"), "");
-            if seen.contains(&url) {
-                continue;
-            }
-            let p: PCIeDevice = self.client.get(&url).await?.1;
-            seen.insert(url);
-            if p.id.is_none() || p.manufacturer.is_none() {
-                // Lenovo has lots of all-null devices with name "Adapater". Ignore those.
-                continue;
-            }
-            out.push(p);
-        }
-        out.sort_unstable_by(|a, b| a.manufacturer.partial_cmp(&b.manufacturer).unwrap());
-        Ok(out)
+        self.pcie_devices_for_chassis(vec![self.system_id().into()])
+            .await
     }
 
     async fn get_firmware(&self, id: &str) -> Result<SoftwareInventory, RedfishError> {
@@ -349,7 +385,7 @@ impl Redfish for RedfishStandard {
         }
         Ok(body)
     }
-    
+
     /// Vec of chassis id
     /// http://redfish.dmtf.org/schemas/v1/ChassisCollection.json
     async fn get_chassis_all(&self) -> Result<Vec<String>, RedfishError> {
@@ -358,6 +394,12 @@ impl Redfish for RedfishStandard {
 
     async fn get_chassis(&self, id: &str) -> Result<Chassis, RedfishError> {
         let url = format!("Chassis/{}", id);
+        let (_status_code, body) = self.client.get(&url).await?;
+        Ok(body)
+    }
+
+    async fn get_chassis_assembly(&self, chassis_id: &str) -> Result<Assembly, RedfishError> {
+        let url = format!("Chassis/{}/Assembly", chassis_id);
         let (_status_code, body) = self.client.get(&url).await?;
         Ok(body)
     }
@@ -455,13 +497,45 @@ impl Redfish for RedfishStandard {
         Ok(())
     }
 
-    async fn add_secure_boot_certificate(&self, pem_cert: &str) -> Result<Task, RedfishError> {
+    async fn get_secure_boot_certificate(
+        &self,
+        database_id: &str,
+        certificate_id: &str,
+    ) -> Result<Certificate, RedfishError> {
+        let url = format!(
+            "Systems/{}/SecureBoot/SecureBootDatabases/{}/Certificates/{}",
+            self.system_id(),
+            database_id,
+            certificate_id
+        );
+        let (_status_code, body) = self.client.get(&url).await?;
+        Ok(body)
+    }
+
+    async fn get_secure_boot_certificates(
+        &self,
+        database_id: &str,
+    ) -> Result<Vec<String>, RedfishError> {
+        let url = format!(
+            "Systems/{}/SecureBoot/SecureBootDatabases/{}/Certificates",
+            self.system_id(),
+            database_id
+        );
+        self.get_members(&url).await
+    }
+
+    async fn add_secure_boot_certificate(
+        &self,
+        pem_cert: &str,
+        database_id: &str,
+    ) -> Result<Task, RedfishError> {
         let mut data = HashMap::new();
         data.insert("CertificateString", pem_cert);
         data.insert("CertificateType", "PEM");
         let url = format!(
-            "Systems/{}/SecureBoot/SecureBootDatabases/db/Certificates",
-            self.system_id()
+            "Systems/{}/SecureBoot/SecureBootDatabases/{}/Certificates",
+            self.system_id(),
+            database_id
         );
         let (_status_code, resp_opt, _resp_headers) = self
             .client
@@ -501,11 +575,20 @@ impl Redfish for RedfishStandard {
         ))
     }
 
-    async fn get_ports(&self, _chassis_id: &str, _network_adapter: &str) -> Result<Vec<String>, RedfishError> {
+    async fn get_ports(
+        &self,
+        _chassis_id: &str,
+        _network_adapter: &str,
+    ) -> Result<Vec<String>, RedfishError> {
         Err(RedfishError::NotSupported("get_ports".to_string()))
     }
 
-    async fn get_port(&self, _chassis_id: &str, _network_adapter: &str, _id: &str) -> Result<NetworkPort, RedfishError> {
+    async fn get_port(
+        &self,
+        _chassis_id: &str,
+        _network_adapter: &str,
+        _id: &str,
+    ) -> Result<NetworkPort, RedfishError> {
         Err(RedfishError::NotSupported("get_port".to_string()))
     }
 
@@ -612,7 +695,10 @@ impl Redfish for RedfishStandard {
         })
     }
 
-    async fn set_boot_order_dpu_first(&self, _address: Option<&str>) -> Result<(), RedfishError> {
+    async fn set_boot_order_dpu_first(
+        &self,
+        _address: &str,
+    ) -> Result<Option<String>, RedfishError> {
         Err(RedfishError::NotSupported(
             "set_boot_order_dpu_first".to_string(),
         ))
@@ -637,7 +723,7 @@ impl Redfish for RedfishStandard {
     }
 
     async fn lockdown_bmc(&self, _target: EnabledDisabled) -> Result<(), RedfishError> {
-        Err(RedfishError::NotSupported("lockdown_bmc".to_string()))
+        Ok(())
     }
 
     async fn is_ipmi_over_lan_enabled(&self) -> Result<bool, RedfishError> {
@@ -706,6 +792,70 @@ impl Redfish for RedfishStandard {
     async fn clear_nvram(&self) -> Result<(), RedfishError> {
         Err(RedfishError::NotSupported("clear_nvram".to_string()))
     }
+
+    async fn get_nic_mode(&self) -> Result<Option<NicMode>, RedfishError> {
+        Ok(None)
+    }
+
+    async fn set_nic_mode(&self, _mode: NicMode) -> Result<(), RedfishError> {
+        Err(RedfishError::NotSupported("set_nic_mode".to_string()))
+    }
+
+    async fn is_infinite_boot_enabled(&self) -> Result<Option<bool>, RedfishError> {
+        Ok(None)
+    }
+
+    async fn enable_infinite_boot(&self) -> Result<(), RedfishError> {
+        Err(RedfishError::NotSupported(
+            "enable_infinite_boot".to_string(),
+        ))
+    }
+
+    async fn set_host_rshim(&self, _enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        Err(RedfishError::NotSupported("set_host_rshim".to_string()))
+    }
+
+    async fn get_host_rshim(&self) -> Result<Option<EnabledDisabled>, RedfishError> {
+        Ok(None)
+    }
+
+    async fn set_idrac_lockdown(&self, _enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        Err(RedfishError::NotSupported("set_idrac_lockdown".to_string()))
+    }
+
+    async fn get_boss_controller(&self) -> Result<Option<String>, RedfishError> {
+        Ok(None)
+    }
+
+    async fn decommission_storage_controller(
+        &self,
+        _controller_id: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        Err(RedfishError::NotSupported(
+            "decommission_storage_controller".to_string(),
+        ))
+    }
+
+    async fn create_storage_volume(
+        &self,
+        _controller_id: &str,
+        _volume_name: &str,
+        _raid_type: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        Err(RedfishError::NotSupported(
+            "create_storage_volume".to_string(),
+        ))
+    }
+
+    async fn is_boot_order_setup(&self, _boot_interface_mac: &str) -> Result<bool, RedfishError> {
+        Err(RedfishError::NotSupported(
+            "is_boot_order_setup".to_string(),
+        ))
+    }
+
+    async fn is_bios_setup(&self, _boot_interface_mac: Option<&str>) -> Result<bool, RedfishError> {
+        Err(RedfishError::NotSupported("is_bios_setup".to_string()))
+    }
 }
 
 impl RedfishStandard {
@@ -714,7 +864,25 @@ impl RedfishStandard {
     //
 
     pub async fn get_members(&self, url: &str) -> Result<Vec<String>, RedfishError> {
-        let (_, mut body): (_, HashMap<String, serde_json::Value>) = self.client.get(url).await?;
+        let (_, body): (_, HashMap<String, serde_json::Value>) = self.client.get(url).await?;
+        self.parse_members(url, body)
+    }
+
+    pub async fn get_members_with_timout(
+        &self,
+        url: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<String>, RedfishError> {
+        let (_, body): (_, HashMap<String, serde_json::Value>) =
+            self.client.get_with_timeout(url, timeout).await?;
+        self.parse_members(url, body)
+    }
+
+    fn parse_members(
+        &self,
+        url: &str,
+        mut body: HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<String>, RedfishError> {
         let key = "Members";
         let members_json = body.remove(key).ok_or_else(|| RedfishError::MissingKey {
             key: key.to_string(),
@@ -733,7 +901,6 @@ impl RedfishStandard {
             .collect();
         Ok(member_ids)
     }
-
     /// Fetch root URL and record the vendor, if any
     pub fn set_vendor(
         &mut self,
@@ -758,19 +925,21 @@ impl RedfishStandard {
             RedfishVendor::Hpe => Ok(Box::new(crate::hpe::Bmc::new(self.clone())?)),
             RedfishVendor::Lenovo => Ok(Box::new(crate::lenovo::Bmc::new(self.clone())?)),
             RedfishVendor::NvidiaDpu => Ok(Box::new(crate::nvidia_dpu::Bmc::new(self.clone())?)),
-            RedfishVendor::NvidiaGBx00 => Ok(Box::new(crate::nvidia_gbx00::Bmc::new(self.clone())?)),
+            RedfishVendor::NvidiaGBx00 => {
+                Ok(Box::new(crate::nvidia_gbx00::Bmc::new(self.clone())?))
+            }
             RedfishVendor::Supermicro => Ok(Box::new(crate::supermicro::Bmc::new(self.clone())?)),
             _ => Ok(Box::new(self.clone())),
         }
     }
 
-    /// Fetch and set System number. Needed for all `Systems/{system_id}/...` calls
+    /// Needed for all `Systems/{system_id}/...` calls
     pub fn set_system_id(&mut self, system_id: &str) -> Result<(), RedfishError> {
         self.system_id = system_id.to_string();
         Ok(())
     }
 
-    /// Fetch and set Manager number. Needed for all `Managers/{system_id}/...` calls
+    /// Needed for all `Managers/{system_id}/...` calls
     pub fn set_manager_id(&mut self, manager_id: &str) -> Result<(), RedfishError> {
         self.manager_id = manager_id.to_string();
         Ok(())
@@ -833,6 +1002,28 @@ impl RedfishStandard {
             .replace(&format!("/{REDFISH_ENDPOINT}/"), "");
         let b: BootOption = self.client.get(&url).await?.1;
         Ok(b)
+    }
+
+    pub async fn fetch_bmc_event_log(
+        &self,
+        url: String,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<LogEntry>, RedfishError> {
+        let url_with_filter = match from {
+            Some(from) => {
+                let filter_value = format!(
+                    "Created ge '{}'",
+                    from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                );
+                let encoded_filter = urlencoding::encode(&filter_value).into_owned();
+                format!("{}?$filter={}", url, encoded_filter)
+            }
+            None => url,
+        };
+
+        let (_status_code, log_entry_collection): (_, LogEntryCollection) =
+            self.client.get(&url_with_filter).await?;
+        Ok(log_entry_collection.members)
     }
 
     // The URL differs for Lenovo, but the rest is the same
@@ -922,11 +1113,20 @@ impl RedfishStandard {
     // Current BIOS attributes
     pub async fn bios_attributes(&self) -> Result<serde_json::Value, RedfishError> {
         let mut b = self.bios().await?;
+
         b.remove("Attributes")
             .ok_or_else(|| RedfishError::MissingKey {
                 key: "Attributes".to_string(),
                 url: format!("Systems/{}/Bios", self.system_id()),
             })
+    }
+
+    pub async fn factory_reset_bios(&self) -> Result<(), RedfishError> {
+        let url = format!("Systems/{}/Bios/Actions/Bios.ResetBios", self.system_id());
+        self.client
+            .req::<(), ()>(Method::POST, &url, None, None, None, Vec::new())
+            .await
+            .map(|_resp| Ok(()))?
     }
 
     pub async fn get_account_by_id(
@@ -1009,25 +1209,28 @@ impl RedfishStandard {
     /// Query the drives status from the server
     pub async fn get_drives_metrics(&self) -> Result<Vec<Drives>, RedfishError> {
         let mut drives: Vec<Drives> = Vec::new();
-        let url = format!("Systems/{}/Storage/", self.system_id());
-        let storage_subsystem: StorageSubsystem = self.client.get(&url).await?.1;
-        if let Some(x) = storage_subsystem.members {
-            for member in x {
-                let url = member
-                    .odata_id
-                    .replace(&format!("/{REDFISH_ENDPOINT}/"), "");
-                let storage: Storage = self.client.get(&url).await?.1;
-                if !storage.drives.is_none() {
-                    for drive in storage.drives.unwrap() {
-                        let url = drive.odata_id.replace(&format!("/{REDFISH_ENDPOINT}/"), "");
-                        let drive: Drives = self.client.get(&url).await?.1;
-                        if let Some(ref id) = drive.id {
-                            if id.contains("USB") {
-                                continue;
-                            }
-                        }
-                        drives.push(drive);
+
+        let storages: Vec<Storage> = self
+            .get_collection(ODataId {
+                odata_id: format!("/redfish/v1/Systems/{}/Storage/", self.system_id()),
+            })
+            .await
+            .and_then(|c| c.try_get::<Storage>())
+            .into_iter()
+            .flat_map(|rc| rc.members)
+            .map(Into::into)
+            .collect();
+
+        for storage in storages {
+            if let Some(d) = storage.drives {
+                for drive in d {
+                    if drive.odata_id.contains("USB") {
+                        continue;
                     }
+                    let url = drive.odata_id.replace(&format!("/{REDFISH_ENDPOINT}/"), "");
+                    let (_, drive): (StatusCode, Drives) = self.client.get(&url).await?;
+
+                    drives.push(drive);
                 }
             }
         }
@@ -1081,6 +1284,38 @@ impl RedfishStandard {
             .post_with_headers(&url, arg, headers)
             .await
             .map(|_resp| Ok(()))?
+    }
+
+    pub async fn pcie_devices_for_chassis(
+        &self,
+        chassis_list: Vec<String>,
+    ) -> Result<Vec<PCIeDevice>, RedfishError> {
+        let mut devices = Vec::new();
+        for chassis in chassis_list {
+            let chassis_devices: Vec<PCIeDevice> = self
+                .get_collection(ODataId {
+                    odata_id: format!("/redfish/v1/Chassis/{}/PCIeDevices/", chassis),
+                })
+                .await
+                .and_then(|c| c.try_get::<PCIeDevice>())
+                .into_iter()
+                .flat_map(|rc| rc.members)
+                .map(Into::into)
+                .filter(|d: &PCIeDevice| {
+                    d.id.is_some()
+                        && d.manufacturer.is_some()
+                        && d.status.as_ref().is_some_and(|s| {
+                            s.state
+                                .as_ref()
+                                .is_some_and(|s| s.to_ascii_lowercase().contains("enabled"))
+                        })
+                })
+                .collect();
+            devices.extend(chassis_devices);
+        }
+
+        devices.sort_unstable_by(|a, b| a.manufacturer.partial_cmp(&b.manufacturer).unwrap());
+        Ok(devices)
     }
 }
 

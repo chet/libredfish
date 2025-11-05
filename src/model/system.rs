@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -55,7 +55,11 @@ pub enum SystemPowerControl {
     /// - Will not restart DPUs
     /// - Will apply pending BIOS/UEFI setting changes
     ForceRestart,
-    // Dell also has: PushPowerButton, PowerCycle, and Nmi
+    /// Do an AC powercycle.  Not supported on all platforms.
+    ACPowercycle,
+    /// Implemented by Dells and DPUs. Not supported on Vikings.
+    PowerCycle,
+    // Dell also has: PushPowerButton and Nmi
     // Lenovo also has: ForceOn and Nmi
 }
 
@@ -73,6 +77,7 @@ pub enum PowerState {
     PoweringOff,
     PoweringOn,
     Paused,
+    Reset,
 }
 
 impl fmt::Display for PowerState {
@@ -117,7 +122,7 @@ pub struct ComponentStatus {
 #[serde(rename_all = "PascalCase")]
 pub struct SystemProcessors {
     #[serde(default)]
-    pub count: i64,
+    pub count: Option<i64>,
     pub logical_processor_count: Option<i64>,
     pub model: Option<String>,
     pub status: Option<ComponentStatus>,
@@ -361,7 +366,7 @@ mod test {
         let data = include_str!("testdata/system_dell.json");
         let result: super::ComputerSystem = serde_json::from_str(data).unwrap();
         assert_eq!(result.power_state, crate::PowerState::On);
-        assert_eq!(result.processor_summary.unwrap().count, 2);
+        assert_eq!(result.processor_summary.unwrap().count, Some(2));
     }
 
     #[test]
@@ -414,7 +419,7 @@ mod test {
             result.oem.unwrap().lenovo.unwrap().total_power_on_hours,
             3816
         );
-        assert_eq!(result.processor_summary.unwrap().count, 2);
+        assert_eq!(result.processor_summary.unwrap().count, Some(2));
     }
 
     #[test]

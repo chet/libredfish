@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -37,7 +37,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
-use libredfish::model::service_root::RedfishVendor;
+use libredfish::model::{certificate::Certificate, service_root::RedfishVendor};
 use libredfish::model::{ComputerSystem, ODataId};
 use libredfish::{
     model::{
@@ -60,8 +60,25 @@ const NVIDIA_VIKING_PORT: &str = "8737";
 const SUPERMICRO_PORT: &str = "8738";
 const DELL_MULTI_DPU_PORT: &str = "8739";
 const NVIDIA_GB200_PORT: &str = "8741";
+const GENERIC_PORT: &str = "8742";
 
 static SETUP: Once = Once::new();
+
+macro_rules! test_vendor_collection_count {
+    ($redfish:expr, $vendor_dir:expr, $method:ident, [$(($vendor:literal, $expected_count:literal)),+ $(,)?]) => {
+        {
+            $(
+                if $vendor_dir == $vendor {
+                    let collection = $redfish.$method().await?;
+                    assert_eq!(collection.len(), $expected_count,
+                        "Expected {} items for vendor {} using {}, got {}",
+                        $expected_count, $vendor, stringify!($method), collection.len());
+                }
+            )+
+            Ok::<(), anyhow::Error>(())
+        }
+    };
+}
 
 #[tokio::test]
 async fn test_dell() -> Result<(), anyhow::Error> {
@@ -101,6 +118,35 @@ async fn test_supermicro() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_nvidia_gb200() -> Result<(), anyhow::Error> {
     run_integration_test("nvidia_gb200", NVIDIA_GB200_PORT).await
+}
+
+#[tokio::test]
+async fn test_forbidden_error_handling() -> anyhow::Result<()> {
+    let _mockup_server = run_mockup_server("forbidden", GENERIC_PORT); // stops on drop
+
+    let endpoint = libredfish::Endpoint {
+        host: format!("127.0.0.1:{GENERIC_PORT}"),
+        ..Default::default()
+    };
+
+    let pool = libredfish::RedfishClientPool::builder().build()?;
+    let redfish = pool.create_standard_client(endpoint)?;
+
+    match redfish.get_chassis_all().await {
+        Ok(_) => panic!("Request should have failed with password change required"),
+        Err(libredfish::RedfishError::PasswordChangeRequired) => {} // what we want
+        Err(err) => panic!("Unexpected error response: {}", err),
+    }
+
+    match redfish.get_systems().await {
+        Ok(_) => panic!("Request should have failed with an HTTP error code"),
+        Err(libredfish::RedfishError::HTTPErrorCode { status_code, .. }) => {
+            assert_eq!(status_code, 403, "Response status code should be forbidden");
+        }
+        Err(err) => panic!("Unexpected error response: {}", err),
+    }
+
+    Ok(())
 }
 
 async fn nvidia_dpu_integration_test(redfish: &dyn Redfish) -> Result<(), anyhow::Error> {
@@ -160,13 +206,18 @@ async fn nvidia_dpu_integration_test(redfish: &dyn Redfish) -> Result<(), anyhow
         system.serial_number.as_ref().unwrap().trim()
     );
 
+    let certificates = redfish.get_secure_boot_certificates("db").await?;
+    assert!(!certificates.is_empty());
+    let certificate: Certificate = redfish.get_secure_boot_certificate("db", "1").await?;
+    assert!(certificate
+        .issuer
+        .get("CommonName")
+        .is_some_and(|x| x.as_str().unwrap().contains("NVIDIA BlueField")));
+
     Ok(())
 }
 
-async fn run_integration_test(
-    vendor_dir: &'static str,
-    port: &'static str,
-) -> Result<(), anyhow::Error> {
+fn run_mockup_server(vendor_dir: &'static str, port: &'static str) -> anyhow::Result<MockupServer> {
     SETUP.call_once(move || {
         use tracing_subscriber::fmt::Layer;
         use tracing_subscriber::prelude::*;
@@ -203,6 +254,14 @@ async fn run_integration_test(
         process: None,
     };
     mockup_server.start()?; // stops on drop
+    Ok(mockup_server)
+}
+
+async fn run_integration_test(
+    vendor_dir: &'static str,
+    port: &'static str,
+) -> Result<(), anyhow::Error> {
+    let _mockup_server = run_mockup_server(vendor_dir, port); // stops on drop
 
     let endpoint = libredfish::Endpoint {
         host: format!("127.0.0.1:{port}"),
@@ -232,17 +291,7 @@ async fn run_integration_test(
         manager_eth_interface_states.push(state);
     }
 
-<<<<<<< HEAD
-    let system_eth_interfaces = redfish.get_system_ethernet_interfaces().await?;
-    assert!(!system_eth_interfaces.is_empty());
-    let mut system_eth_interface_states: Vec<libredfish::EthernetInterface> = Vec::new();
-    for iface in &system_eth_interfaces {
-        let state = redfish.get_system_ethernet_interface(iface).await?;
-        let mac = state.mac_address.clone().unwrap();
-        if !all_macs.insert(mac.clone()) {
-            panic!("Duplicate MAC address {} on interface {}", mac, iface);
-=======
-    if vendor_dir != "nvidia_gh200" && vendor_dir != "nvidia_gb200" {
+    if vendor_dir != "nvidia_gb200" {
         let system_eth_interfaces = redfish.get_system_ethernet_interfaces().await?;
         assert!(!system_eth_interfaces.is_empty());
         let mut system_eth_interface_states: Vec<libredfish::EthernetInterface> = Vec::new();
@@ -253,9 +302,7 @@ async fn run_integration_test(
                 panic!("Duplicate MAC address {} on interface {}", mac, iface);
             }
             system_eth_interface_states.push(state);
->>>>>>> 82bc799f1 (feat: add gb200 bianca compute board bmc support)
         }
-        system_eth_interface_states.push(state);
     }
 
     let chassis = redfish.get_chassis_all().await?;
@@ -338,14 +385,19 @@ async fn run_integration_test(
     if vendor_dir == "lenovo" {
         assert!(redfish.lockdown_status().await?.is_fully_enabled());
     }
-    _ = redfish.get_thermal_metrics().await?;
+
+    let tm = redfish.get_thermal_metrics().await?;
+    if vendor_dir == "nvidia_gb200" {
+        assert!(tm.leak_detectors.is_some());
+        assert_eq!(tm.leak_detectors.unwrap().len(), 4)
+    }
     _ = redfish.get_power_metrics().await?;
+
     if vendor_dir != "supermicro" {
         _ = redfish.get_system_event_log().await?;
     }
 
     if vendor_dir == "nvidia_viking" {
-        redfish.set_boot_order_dpu_first(None).await?;
         let gpus = redfish.get_gpu_sensors().await?;
         for gpu in gpus {
             for sensor in gpu.sensors {
@@ -354,12 +406,58 @@ async fn run_integration_test(
             }
         }
     }
-    resource_tests(&redfish).await?;
+
+    test_vendor_collection_count!(
+        redfish,
+        vendor_dir,
+        get_accounts,
+        [
+            ("nvidia_viking", 3),
+            ("dell", 16),
+            ("lenovo", 1),
+            ("supermicro", 2),
+            ("nvidia_gb200", 4),
+            ("dell_multi_dpu", 16),
+            ("hpe", 2),
+        ]
+    )?;
+
+    test_vendor_collection_count!(
+        redfish,
+        vendor_dir,
+        get_drives_metrics,
+        [
+            ("nvidia_viking", 0), // drives are not stored properly
+            ("dell", 3),
+            ("lenovo", 4),
+            ("supermicro", 8),
+            ("nvidia_gb200", 9),
+            ("dell_multi_dpu", 2),
+            ("hpe", 18),
+        ]
+    )?;
+
+    test_vendor_collection_count!(
+        redfish,
+        vendor_dir,
+        pcie_devices,
+        [
+            ("nvidia_viking", 12),
+            ("dell", 13),
+            ("lenovo", 15),
+            ("supermicro", 26),
+            ("nvidia_gb200", 0), // have no pcie devices
+            ("dell_multi_dpu", 10),
+            ("hpe", 6),
+        ]
+    )?;
+
+    resource_tests(redfish.as_ref()).await?;
 
     Ok(())
 }
 
-async fn resource_tests(redfish: &Box<dyn Redfish>) -> Result<(), anyhow::Error> {
+async fn resource_tests(redfish: &dyn Redfish) -> Result<(), anyhow::Error> {
     pub enum UriType {
         ODataId(ODataId),
         OptionODataId(Option<ODataId>),
@@ -388,14 +486,14 @@ async fn resource_tests(redfish: &Box<dyn Redfish>) -> Result<(), anyhow::Error>
                 .unwrap_or("unknown-type");
             // viking's mockup data contains some chassis w.o @odata.type, until we clean up mockup data we
             // need to bypass that case
-            if member_odata_type == "" && vendor == RedfishVendor::AMI {
+            if member_odata_type.is_empty() && vendor == RedfishVendor::AMI {
                 continue;
             }
             assert_eq!(collection_type, member_odata_type);
         }
     }
     async fn test_type<T>(
-        redfish: &Box<dyn Redfish>,
+        redfish: &dyn Redfish,
         uri: UriType,
         vendor: RedfishVendor,
     ) -> Result<ResourceCollection<T>, anyhow::Error>
@@ -415,7 +513,7 @@ async fn resource_tests(redfish: &Box<dyn Redfish>) -> Result<(), anyhow::Error>
                 verify_collection(&x, vendor);
                 Ok(x)
             }
-            Err(e) => return Err(anyhow!(e.to_string())),
+            Err(e) => Err(anyhow!(e.to_string())),
         }
     }
 
@@ -449,10 +547,9 @@ async fn resource_tests(redfish: &Box<dyn Redfish>) -> Result<(), anyhow::Error>
         RedfishVendor::NvidiaGBx00 => "Chassis_0", // this is not the catch-all chassis id, gb200 redfish is not structured to aggregate into one chassis id
         _ => return Err(anyhow!("Unknown vendor could not identify chassis")),
     };
-    if vendor != RedfishVendor::Nvidia {
+    if vendor != RedfishVendor::NvidiaDpu {
         let ch = match chassis_rc
             .members
-            .iter()
             .into_iter()
             .find(|c| c.id.clone().unwrap_or_default() == chassis_id)
         {

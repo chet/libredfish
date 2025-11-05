@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,6 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::debug;
 
+use super::oem::ChassisExtensions;
 use super::resource::OData;
 use super::{ODataId, ODataLinks, OnOff, PCIeFunction, ResourceStatus};
 use crate::NetworkDeviceFunction;
@@ -124,6 +125,7 @@ pub struct Chassis {
     pub thermal: Option<ODataId>,
     pub thermal_subsystem: Option<ODataId>,
     pub trusted_components: Option<ODataId>,
+    pub oem: Option<ChassisExtensions>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -162,14 +164,51 @@ pub struct NetworkAdapterControllerLinks {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
 pub struct Location {
     pub part_location: Option<PartLocation>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
 pub struct PartLocation {
     pub location_type: Option<String>,
 }
+/// http://redfish.dmtf.org/schemas/v1/Assembly.v1_3_0.json
+/// The Assembly schema defines an assembly. Assembly information contains
+/// details about a device, such as part number, serial number, manufacturer,
+/// and production date.
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct Assembly {
+    #[serde(flatten)]
+    pub odata: Option<ODataLinks>,
+    #[serde(default)]
+    pub assemblies: Vec<AssemblyData>,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct AssemblyData {
+    #[serde(rename = "@odata.id")]
+    pub odata_id: Option<String>,
+    pub location: Option<Location>,
+    #[serde(default)]
+    pub member_id: String,
+    pub model: Option<String>,
+    pub name: Option<String>,
+    pub part_number: Option<String>,
+    pub physical_context: Option<String>,
+    pub production_date: Option<String>,
+    pub serial_number: Option<String>,
+    pub vendor: Option<String>,
+    pub version: Option<String>,
+}
+
 // This is a convenient container struct to hold
 // details of a network interface.
 pub struct MachineNetworkAdapter {

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -23,16 +23,14 @@
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use reqwest::{
-    header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE},
+    header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, IF_MATCH},
     multipart::{Form, Part},
     Client as HttpClient, ClientBuilder as HttpClientBuilder, Method, Proxy, StatusCode,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::debug;
 
-use crate::{
-    model::error, model::InvalidValueError, standard::RedfishStandard, Redfish, RedfishError,
-};
+use crate::{model::InvalidValueError, standard::RedfishStandard, Redfish, RedfishError};
 
 pub const REDFISH_ENDPOINT: &str = "redfish/v1";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -226,15 +224,24 @@ impl RedfishHttpClient {
     where
         T: DeserializeOwned + ::std::fmt::Debug,
     {
+        self.get_with_timeout(api, None).await
+    }
+    pub async fn get_with_timeout<T>(
+        &self,
+        api: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(StatusCode, T), RedfishError>
+    where
+        T: DeserializeOwned + ::std::fmt::Debug,
+    {
         let (status_code, resp_opt, _resp_headers) = self
-            .req::<T, String>(Method::GET, api, None, None, None, Vec::new())
+            .req::<T, String>(Method::GET, api, None, timeout, None, Vec::new())
             .await?;
         match resp_opt {
             Some(response_body) => Ok((status_code, response_body)),
             None => Err(RedfishError::NoContent),
         }
     }
-
     pub async fn post<B>(
         &self,
         api: &str,
@@ -320,9 +327,29 @@ impl RedfishHttpClient {
         Ok((status_code, resp_headers))
     }
 
-    // Various parts of Redfish do use DELETE, but we don't implement any of those yet,
-    // hence allow dead_code.
-    #[allow(dead_code)]
+    pub async fn patch_with_if_match<B>(&self, api: &str, data: B) -> Result<(), RedfishError>
+    where
+        B: Serialize + ::std::fmt::Debug,
+    {
+        let timeout = Duration::from_secs(60);
+        let headers: Vec<(HeaderName, String)> = vec![(IF_MATCH, "*".to_string())];
+        let (status_code, resp_body, _): (
+            _,
+            Option<HashMap<String, serde_json::Value>>,
+            Option<HeaderMap>,
+        ) = self
+            .req(Method::PATCH, api, Some(data), Some(timeout), None, headers)
+            .await?;
+        match status_code {
+            StatusCode::NO_CONTENT => Ok(()),
+            _ => Err(RedfishError::HTTPErrorCode {
+                url: api.to_string(),
+                status_code,
+                response_body: format!("{:?}", resp_body.unwrap_or_default()),
+            }),
+        }
+    }
+
     pub async fn delete(&self, api: &str) -> Result<StatusCode, RedfishError> {
         let (status_code, _resp_body, _resp_headers): (
             _,
@@ -371,6 +398,7 @@ impl RedfishHttpClient {
     }
 
     // All the HTTP requests happen from here.
+    #[tracing::instrument(name = "libredfish::request", skip_all, fields(uri=api), level = tracing::Level::DEBUG)]
     async fn _req<T, B>(
         &self,
         method: &Method,
@@ -414,7 +442,6 @@ impl RedfishHttpClient {
             url,
             body_enc.as_deref().unwrap_or_default()
         );
-
         let mut req_b = match *method {
             Method::GET => self.http_client.get(&url),
             Method::POST => self.http_client.post(&url),
@@ -492,27 +519,24 @@ impl RedfishHttpClient {
 
         if !status_code.is_success() {
             if status_code == StatusCode::FORBIDDEN && !response_body.is_empty() {
-                let err: error::Error = match serde_json::from_str(&response_body) {
-                    Ok(redfish_err) => redfish_err,
-                    Err(e) => {
-                        return Err(RedfishError::JsonDeserializeError {
-                            url,
-                            body: response_body,
-                            source: e,
-                        });
-                    }
-                };
-                if err
-                    .error
-                    .extended
-                    .iter()
-                    // TODO(ajf) The actual message ID is specified in DTMF RedFish 9.5.11.2 so we
-                    // should properly parse it into a type since the error may come from different
-                    // MessageRegistries
-                    .any(|ext| ext.message_id.ends_with("PasswordChangeRequired"))
+                // If PasswordChangeRequired is in the response, return a PasswordChangeRequired error.
+                if let Ok(err) = serde_json::from_str::<crate::model::error::Error>(&response_body)
                 {
-                    return Err(RedfishError::PasswordChangeRequired);
+                    if err
+                        .error
+                        .extended
+                        .iter()
+                        // TODO(ajf) The actual message ID is specified in DTMF RedFish 9.5.11.2 so we
+                        // should properly parse it into a type since the error may come from different
+                        // MessageRegistries
+                        .any(|ext| ext.message_id.ends_with("PasswordChangeRequired"))
+                    {
+                        return Err(RedfishError::PasswordChangeRequired);
+                    }
                 }
+                // If we can't decode the error JSON, just return the normal HTTPErrorCode. Some
+                // misbehaved BMCs will return an XHTML document for forbidden responses, for
+                // instance.
             }
             return Err(RedfishError::HTTPErrorCode {
                 url,
@@ -560,6 +584,9 @@ impl RedfishHttpClient {
             }
         };
 
+        // Some vendors, but not all, have a prefix at the start of the given endpoint.
+        let api_str = api.to_string();
+        let api = api_str.strip_prefix("/").unwrap_or(api);
         // Some (Lenovo, perhaps others) vendors have nonstandard endpoint names for multipart upload.
         let with_redfish_endpoint = if drop_redfish_url_part {
             api.to_string()

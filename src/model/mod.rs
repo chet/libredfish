@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -42,6 +42,7 @@ pub mod oem;
 pub mod secure_boot;
 
 pub mod account_service;
+pub mod certificate;
 pub mod chassis;
 pub mod error;
 pub mod ethernet_interface;
@@ -318,6 +319,7 @@ pub enum OnOff {
     On,
     #[default]
     Off,
+    Reset,
 }
 
 impl fmt::Display for OnOff {
@@ -386,6 +388,7 @@ impl fmt::Display for ResourceHealth {
 pub enum ResourceState {
     Enabled,
     Disabled,
+    Degraded,
     StandbyOffline,
     StandbySpare,
     InTest,

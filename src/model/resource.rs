@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -39,7 +39,7 @@ use crate::{Chassis, RedfishError};
 // @odata.context   optional            optional
 //
 // OData structure will capture all those 4 properties.
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Eq)]
 pub struct OData {
     // Registry resources in a response may include an @odata.id property. All other resources and resource
     // collections in a response shall include an @odata.id property. The value of the identifier property shall
@@ -59,6 +59,12 @@ pub struct OData {
     // describes the source of the payload
     #[serde(rename = "@odata.context")]
     pub odata_context: Option<String>,
+}
+
+impl PartialEq for OData {
+    fn eq(&self, other: &OData) -> bool {
+        self.odata_id == other.odata_id
+    }
 }
 
 // This trait is used as a bound (constraint) in generic definitions
@@ -378,3 +384,5 @@ impl_is_resource!(crate::NetworkAdapter);
 impl_is_resource!(crate::model::sensor::Sensor);
 impl_is_resource!(crate::model::Manager);
 impl_is_resource!(crate::model::BootOption);
+impl_is_resource!(crate::model::account_service::ManagerAccount);
+impl_is_resource!(crate::model::storage::Storage);

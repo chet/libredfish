@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -22,32 +22,71 @@
  */
 use std::{collections::HashMap, path::Path, time::Duration};
 
+use serde_json::Value;
+
 use crate::{
     model::{
         account_service::ManagerAccount,
-        chassis::{Chassis, NetworkAdapter},
+        certificate::Certificate,
+        chassis::{Assembly, Chassis, NetworkAdapter},
         network_device_function::NetworkDeviceFunction,
-        oem::hpe::{self, BootDevices},
+        oem::{
+            hpe::{self, BootDevices},
+            nvidia_dpu::NicMode,
+        },
         power::Power,
-        resource::ResourceCollection,
         secure_boot::SecureBoot,
         sel::{LogEntry, LogEntryCollection},
         sensor::GPUSensors,
-        service_root::ServiceRoot,
+        service_root::{RedfishVendor, ServiceRoot},
         software_inventory::SoftwareInventory,
-        storage,
-        storage::Drives,
+        storage::{self, Drives},
         task::Task,
         thermal::Thermal,
         update_service::{ComponentType, TransferProtocolType, UpdateService},
-        BootOption, ComputerSystem, Manager, PCIeFunction,
+        BootOption, ComputerSystem, Manager, Slot, SystemStatus,
     },
+    network::REDFISH_ENDPOINT,
     standard::RedfishStandard,
-    Boot, BootOptions, Collection,
+    BiosProfileType, Boot, BootOptions, Collection, Deserialize,
     EnabledDisabled::{self, Disabled, Enabled},
-    MachineSetupStatus, JobState, ODataId, PCIeDevice, PowerState, Redfish, RedfishError, Resource,
-    RoleId, Status, StatusInternal, SystemPowerControl,
+    JobState, MachineSetupDiff, MachineSetupStatus, OData, ODataId, PCIeDevice, PowerState,
+    Redfish, RedfishError, Resource, RoleId, Serialize, Status, StatusInternal, SystemPowerControl,
 };
+
+// The following is specific for the HPE machine since the HPE redfish
+// doesn't return pcie odata.id during power on transition
+// HpeOData structure will try to capture all those 4 properties.
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct HpeOData {
+    #[serde(rename = "@odata.id")]
+    pub odata_id: Option<String>, // This is unique for HPE machine
+    #[serde(rename = "@odata.type")]
+    pub odata_type: String,
+    #[serde(rename = "@odata.etag")]
+    pub odata_etag: Option<String>,
+    #[serde(rename = "@odata.context")]
+    pub odata_context: Option<String>,
+}
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct HpePCIeDevice {
+    #[serde(flatten)]
+    pub odata: HpeOData,
+    pub description: Option<String>,
+    pub firmware_version: Option<String>,
+    pub id: Option<String>,
+    pub manufacturer: Option<String>,
+    #[serde(rename = "GPUVendor")]
+    pub gpu_vendor: Option<String>,
+    pub name: Option<String>,
+    pub part_number: Option<String>,
+    pub serial_number: Option<String>,
+    pub status: Option<SystemStatus>,
+    pub slot: Option<Slot>,
+    #[serde(default, rename = "PCIeFunctions")]
+    pub pcie_functions: Option<ODataId>,
+}
 
 pub struct Bmc {
     s: RedfishStandard,
@@ -68,6 +107,10 @@ impl Redfish for Bmc {
         role_id: RoleId,
     ) -> Result<(), RedfishError> {
         self.s.create_user(username, password, role_id).await
+    }
+
+    async fn delete_user(&self, username: &str) -> Result<(), RedfishError> {
+        self.s.delete_user(username).await
     }
 
     async fn change_username(&self, old_name: &str, new_name: &str) -> Result<(), RedfishError> {
@@ -102,9 +145,28 @@ impl Redfish for Bmc {
         if action == SystemPowerControl::ForceRestart {
             // hpe ilo does warm reset with gracefulrestart op
             self.s.power(SystemPowerControl::GracefulRestart).await
+        } else if action == SystemPowerControl::ACPowercycle {
+            let power_state = self.get_power_state().await?;
+            match power_state {
+                PowerState::Off => {}
+                _ => {
+                    self.s.power(SystemPowerControl::ForceOff).await?;
+                }
+            }
+            let args: HashMap<String, String> =
+                HashMap::from([("ResetType".to_string(), "AuxCycle".to_string())]);
+            let url = format!(
+                "Systems/{}/Actions/Oem/Hpe/HpeComputerSystemExt.SystemReset",
+                self.s.system_id()
+            );
+            return self.s.client.post(&url, args).await.map(|_status_code| ());
         } else {
             self.s.power(action).await
         }
+    }
+
+    fn ac_powercycle_supported_by_power(&self) -> bool {
+        true
     }
 
     async fn bmc_reset(&self) -> Result<(), RedfishError> {
@@ -131,6 +193,15 @@ impl Redfish for Bmc {
         self.get_system_event_log().await
     }
 
+    async fn get_bmc_event_log(
+        &self,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<LogEntry>, RedfishError> {
+        let manager_id = self.s.manager_id();
+        let url = format!("Managers/{manager_id}/LogServices/IEL/Entries");
+        self.s.fetch_bmc_event_log(url, from).await
+    }
+
     async fn get_drives_metrics(&self) -> Result<Vec<Drives>, RedfishError> {
         self.s.get_drives_metrics().await
     }
@@ -139,17 +210,86 @@ impl Redfish for Bmc {
         self.s.bios().await
     }
 
-    async fn machine_setup(&self, boot_interface_mac: Option<&str>) -> Result<(), RedfishError> {
+    async fn set_bios(
+        &self,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Result<(), RedfishError> {
+        self.s.set_bios(values).await
+    }
+
+    async fn reset_bios(&self) -> Result<(), RedfishError> {
+        let hp_bios = self.s.bios().await?;
+        // Access the Actions map
+        let actions = hp_bios
+            .get("Actions")
+            .and_then(|v: &Value| v.as_object())
+            .ok_or(RedfishError::NoContent)?;
+        // Access the "#Bios.ResetBios" action
+        let reset = actions
+            .get("#Bios.ResetBios")
+            .and_then(|v| v.as_object())
+            .ok_or(RedfishError::NoContent)?;
+        // Access the "target" URL
+        let target = reset
+            .get("target")
+            .and_then(|v| v.as_str())
+            .ok_or(RedfishError::NoContent)?;
+        let url = target.replace(&format!("/{REDFISH_ENDPOINT}/"), "");
+        self.s
+            .client
+            .req::<(), ()>(reqwest::Method::POST, &url, None, None, None, Vec::new())
+            .await
+            .map(|_resp| Ok(()))?
+    }
+
+    async fn machine_setup(
+        &self,
+        _boot_interface_mac: Option<&str>,
+        _bios_profiles: &HashMap<
+            RedfishVendor,
+            HashMap<String, HashMap<BiosProfileType, HashMap<String, serde_json::Value>>>,
+        >,
+        _selected_profile: BiosProfileType,
+    ) -> Result<(), RedfishError> {
         self.setup_serial_console().await?;
         self.clear_tpm().await?;
         self.set_virt_enable().await?;
         self.set_uefi_nic_boot().await?;
-        self.set_boot_order(BootDevices::Pxe).await?;
-        self.set_boot_order_dpu_first(boot_interface_mac).await
+        self.set_boot_order(BootDevices::Pxe).await
     }
 
-    async fn machine_setup_status(&self) -> Result<MachineSetupStatus, RedfishError> {
-        Err(RedfishError::NotSupported("machine_setup_status".to_string()))
+    async fn machine_setup_status(
+        &self,
+        boot_interface_mac: Option<&str>,
+    ) -> Result<MachineSetupStatus, RedfishError> {
+        // Check BIOS and BMC attributes
+        let mut diffs = self.diff_bios_bmc_attr().await?;
+
+        if let Some(mac) = boot_interface_mac {
+            let (expected, actual) = self.get_expected_and_actual_first_boot_option(mac).await?;
+            if expected.is_none() || expected != actual {
+                diffs.push(MachineSetupDiff {
+                    key: "boot_first".to_string(),
+                    expected: expected.unwrap_or_else(|| "Not found".to_string()),
+                    actual: actual.unwrap_or_else(|| "Not found".to_string()),
+                });
+            }
+        }
+
+        // Check lockdown status
+        let lockdown = self.lockdown_status().await?;
+        if !lockdown.is_fully_enabled() {
+            diffs.push(MachineSetupDiff {
+                key: "lockdown".to_string(),
+                expected: "Enabled".to_string(),
+                actual: lockdown.status.to_string(),
+            });
+        }
+
+        Ok(MachineSetupStatus {
+            is_done: diffs.is_empty(),
+            diffs,
+        })
     }
 
     async fn set_machine_password_policy(&self) -> Result<(), RedfishError> {
@@ -157,15 +297,15 @@ impl Redfish for Bmc {
         let hpe = Value::Object(serde_json::Map::from_iter(vec![
             (
                 "AuthFailureDelayTimeSeconds".to_string(),
-                Value::Number(0.into()),
+                Value::Number(2.into()), // Hpe iLO 5 only allows 2, 5, 10, 30
             ),
             (
                 "AuthFailureLoggingThreshold".to_string(),
-                Value::Number(0.into()),
+                Value::Number(0.into()), // Hpe iLO 5 only allows 0, 1, 2, 3, 5
             ),
             (
                 "AuthFailuresBeforeDelay".to_string(),
-                Value::Number(0.into()),
+                Value::Number(0.into()), // Hpe iLO 5 only allows 0, 1, 3, 5
             ),
             ("EnforcePasswordComplexity".to_string(), Value::Bool(false)),
         ]));
@@ -295,15 +435,42 @@ impl Redfish for Bmc {
     async fn pcie_devices(&self) -> Result<Vec<PCIeDevice>, RedfishError> {
         let mut out = Vec::new();
         let chassis = self.get_chassis(self.s.system_id()).await?;
-        let Some(collection_oid) = chassis.pcie_devices else {
+        if chassis.pcie_devices.is_none() {
             return Ok(vec![]);
-        };
-        let devices: ResourceCollection<PCIeDevice> = self
-            .s
-            .get_collection(collection_oid)
-            .await
-            .and_then(|r| r.try_get())?;
-        for mut pcie in devices.members {
+        }
+        let mut devices: Vec<HpePCIeDevice> = Vec::new();
+        let url = chassis
+            .pcie_devices
+            .unwrap()
+            .odata_id
+            .replace(&format!("/{REDFISH_ENDPOINT}/"), "");
+        let pcie_devices = self.s.get_members(&url).await?;
+        for pcie_oid in pcie_devices {
+            let dev_url = format!("{}/{}", &url, pcie_oid);
+            let (_, hpe_pcie) = self.s.client.get(&dev_url).await?;
+            devices.push(hpe_pcie);
+        }
+        // for mut pcie in devices.members {
+        for hpe_pcie in devices {
+            let mut pcie = PCIeDevice {
+                odata: OData {
+                    odata_type: hpe_pcie.odata.odata_type,
+                    odata_id: hpe_pcie.odata.odata_id.unwrap_or_default(),
+                    odata_etag: hpe_pcie.odata.odata_etag,
+                    odata_context: hpe_pcie.odata.odata_context,
+                },
+                description: hpe_pcie.description,
+                firmware_version: hpe_pcie.firmware_version,
+                id: hpe_pcie.id,
+                manufacturer: hpe_pcie.manufacturer,
+                gpu_vendor: hpe_pcie.gpu_vendor,
+                name: hpe_pcie.name,
+                part_number: hpe_pcie.part_number,
+                serial_number: hpe_pcie.serial_number,
+                status: hpe_pcie.status,
+                slot: hpe_pcie.slot,
+                pcie_functions: hpe_pcie.pcie_functions,
+            };
             if pcie.status.is_none() {
                 continue;
             }
@@ -354,8 +521,31 @@ impl Redfish for Bmc {
         self.s.get_system().await
     }
 
-    async fn add_secure_boot_certificate(&self, pem_cert: &str) -> Result<Task, RedfishError> {
-        self.s.add_secure_boot_certificate(pem_cert).await
+    async fn get_secure_boot_certificate(
+        &self,
+        database_id: &str,
+        certificate_id: &str,
+    ) -> Result<Certificate, RedfishError> {
+        self.s
+            .get_secure_boot_certificate(database_id, certificate_id)
+            .await
+    }
+
+    async fn get_secure_boot_certificates(
+        &self,
+        database_id: &str,
+    ) -> Result<Vec<String>, RedfishError> {
+        self.s.get_secure_boot_certificates(database_id).await
+    }
+
+    async fn add_secure_boot_certificate(
+        &self,
+        pem_cert: &str,
+        database_id: &str,
+    ) -> Result<Task, RedfishError> {
+        self.s
+            .add_secure_boot_certificate(pem_cert, database_id)
+            .await
     }
 
     async fn get_secure_boot(&self) -> Result<SecureBoot, RedfishError> {
@@ -389,18 +579,34 @@ impl Redfish for Bmc {
     }
 
     async fn get_chassis_all(&self) -> Result<Vec<String>, RedfishError> {
-        self.s.get_chassis_all().await
+        self.s.get_members("Chassis").await
     }
 
     async fn get_chassis(&self, id: &str) -> Result<Chassis, RedfishError> {
         self.s.get_chassis(id).await
     }
 
+    async fn get_chassis_assembly(&self, chassis_id: &str) -> Result<Assembly, RedfishError> {
+        self.s.get_chassis_assembly(chassis_id).await
+    }
+
     async fn get_chassis_network_adapters(
         &self,
         chassis_id: &str,
     ) -> Result<Vec<String>, RedfishError> {
-        self.s.get_chassis_network_adapters(chassis_id).await
+        // self.s.get_chassis_network_adapters(chassis_id).await
+        let chassis = self.s.get_chassis(chassis_id).await?;
+        if chassis.network_adapters.is_some() {
+            let url = chassis
+                .network_adapters
+                .unwrap()
+                .odata_id
+                .replace(&format!("/{REDFISH_ENDPOINT}/"), "");
+            // let url = format!("Chassis/{}/NetworkAdapters", chassis_id);
+            self.s.get_members(&url).await
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     async fn get_chassis_network_adapter(
@@ -429,7 +635,11 @@ impl Redfish for Bmc {
         Ok(body)
     }
 
-    async fn get_ports(&self, chassis_id: &str, network_adapter: &str) -> Result<Vec<String>, RedfishError> {
+    async fn get_ports(
+        &self,
+        chassis_id: &str,
+        network_adapter: &str,
+    ) -> Result<Vec<String>, RedfishError> {
         self.s.get_ports(chassis_id, network_adapter).await
     }
 
@@ -469,9 +679,32 @@ impl Redfish for Bmc {
         current_uefi_password: &str,
         new_uefi_password: &str,
     ) -> Result<Option<String>, RedfishError> {
-        self.s
-            .change_uefi_password(current_uefi_password, new_uefi_password)
-            .await
+        let hp_bios = self.s.bios().await?;
+        // Access the Actions map
+        let actions = hp_bios
+            .get("Actions")
+            .and_then(|v| v.as_object())
+            .ok_or(RedfishError::NoContent)?;
+        // Access the "#Bios.ChangePassword" action
+        let change_password = actions
+            .get("#Bios.ChangePassword")
+            .and_then(|v| v.as_object())
+            .ok_or(RedfishError::NoContent)?;
+        // Access the "target" URL
+        let target = change_password
+            .get("target")
+            .and_then(|v| v.as_str())
+            .ok_or(RedfishError::NoContent)?;
+
+        let mut arg = HashMap::new();
+        arg.insert("PasswordName", "AdministratorPassword".to_string());
+        arg.insert("OldPassword", current_uefi_password.to_string());
+        arg.insert("NewPassword", new_uefi_password.to_string());
+
+        let url = target.replace(&format!("/{REDFISH_ENDPOINT}/"), "");
+        self.s.client.post(&url, arg).await?;
+
+        Ok(None)
     }
 
     async fn change_boot_order(&self, boot_array: Vec<String>) -> Result<(), RedfishError> {
@@ -495,7 +728,14 @@ impl Redfish for Bmc {
     }
 
     async fn bmc_reset_to_defaults(&self) -> Result<(), RedfishError> {
-        self.s.bmc_reset_to_defaults().await
+        let url = format!(
+            "Managers/{}/Actions/Oem/Hpe/HpeiLO.ResetToFactoryDefaults",
+            self.s.manager_id()
+        );
+        let mut arg = HashMap::new();
+        arg.insert("Action", "HpeiLO.ResetToFactoryDefaults".to_string());
+        arg.insert("ResetType", "Default".to_string());
+        self.s.client.post(&url, arg).await.map(|_resp| Ok(()))?
     }
 
     async fn get_job_state(&self, job_id: &str) -> Result<JobState, RedfishError> {
@@ -516,15 +756,9 @@ impl Redfish for Bmc {
 
     async fn set_boot_order_dpu_first(
         &self,
-        mac_address: Option<&str>,
-    ) -> Result<(), RedfishError> {
-        let mac = {
-            match mac_address {
-                Some(mac) => mac.to_string(),
-                None => self.dpu_mac().await?,
-            }
-        }
-        .to_uppercase();
+        mac_address: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        let mac = mac_address.to_string().to_uppercase();
 
         let all = self.get_boot_options().await?;
         let mut boot_ref = None;
@@ -541,7 +775,28 @@ impl Redfish for Bmc {
             return Err(RedfishError::MissingBootOption(format!("HTTP IPv4 {mac}")));
         };
 
-        self.set_first_boot(&boot_ref).await
+        match self.set_first_boot(&boot_ref).await {
+            Err(RedfishError::HTTPErrorCode {
+                url,
+                status_code,
+                response_body,
+            }) => {
+                if response_body.contains("UnableToModifyDuringSystemPOST") {
+                    tracing::info!(
+                        "redfish set_first_boot might fail due to HPE POST race condition, ignore."
+                    );
+                    Ok(None)
+                } else {
+                    Err(RedfishError::HTTPErrorCode {
+                        url,
+                        status_code,
+                        response_body,
+                    })
+                }
+            }
+            Ok(()) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     async fn clear_uefi_password(
@@ -588,9 +843,114 @@ impl Redfish for Bmc {
     async fn clear_nvram(&self) -> Result<(), RedfishError> {
         self.s.clear_nvram().await
     }
+
+    async fn get_nic_mode(&self) -> Result<Option<NicMode>, RedfishError> {
+        self.s.get_nic_mode().await
+    }
+
+    async fn set_nic_mode(&self, mode: NicMode) -> Result<(), RedfishError> {
+        self.s.set_nic_mode(mode).await
+    }
+
+    async fn enable_infinite_boot(&self) -> Result<(), RedfishError> {
+        self.s.enable_infinite_boot().await
+    }
+
+    async fn is_infinite_boot_enabled(&self) -> Result<Option<bool>, RedfishError> {
+        self.s.is_infinite_boot_enabled().await
+    }
+
+    async fn set_host_rshim(&self, enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        self.s.set_host_rshim(enabled).await
+    }
+
+    async fn get_host_rshim(&self) -> Result<Option<EnabledDisabled>, RedfishError> {
+        self.s.get_host_rshim().await
+    }
+
+    async fn set_idrac_lockdown(&self, enabled: EnabledDisabled) -> Result<(), RedfishError> {
+        self.s.set_idrac_lockdown(enabled).await
+    }
+
+    async fn get_boss_controller(&self) -> Result<Option<String>, RedfishError> {
+        self.s.get_boss_controller().await
+    }
+
+    async fn decommission_storage_controller(
+        &self,
+        controller_id: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        self.s.decommission_storage_controller(controller_id).await
+    }
+
+    async fn create_storage_volume(
+        &self,
+        controller_id: &str,
+        volume_name: &str,
+        raid_type: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        self.s
+            .create_storage_volume(controller_id, volume_name, raid_type)
+            .await
+    }
+
+    async fn is_boot_order_setup(&self, boot_interface_mac: &str) -> Result<bool, RedfishError> {
+        let (expected, actual) = self
+            .get_expected_and_actual_first_boot_option(boot_interface_mac)
+            .await?;
+        Ok(expected.is_some() && expected == actual)
+    }
+
+    async fn is_bios_setup(&self, _boot_interface_mac: Option<&str>) -> Result<bool, RedfishError> {
+        let diffs = self.diff_bios_bmc_attr().await?;
+        Ok(diffs.is_empty())
+    }
 }
 
 impl Bmc {
+    /// Check BIOS and BMC attributes and return differences
+    async fn diff_bios_bmc_attr(&self) -> Result<Vec<MachineSetupDiff>, RedfishError> {
+        let mut diffs = vec![];
+
+        let sc = self.serial_console_status().await?;
+        if !sc.is_fully_enabled() {
+            diffs.push(MachineSetupDiff {
+                key: "serial_console".to_string(),
+                expected: "Enabled".to_string(),
+                actual: sc.status.to_string(),
+            });
+        }
+
+        // clear_tpm has no 'check' operation, so skip that
+
+        let virt = self.get_virt_enabled().await?;
+        if virt != EnabledDisabled::Enabled {
+            diffs.push(MachineSetupDiff {
+                key: "Processors_IntelVirtualizationTechnology".to_string(),
+                expected: EnabledDisabled::Enabled.to_string(),
+                actual: virt.to_string(),
+            });
+        }
+
+        let (dhcpv4, http_support) = self.get_uefi_nic_boot().await?;
+        if dhcpv4 != EnabledDisabled::Enabled {
+            diffs.push(MachineSetupDiff {
+                key: "Dhcpv4".to_string(),
+                expected: EnabledDisabled::Enabled.to_string(),
+                actual: dhcpv4.to_string(),
+            });
+        }
+        if http_support != "Auto" {
+            diffs.push(MachineSetupDiff {
+                key: "HttpSupport".to_string(),
+                expected: "Auto".to_string(),
+                actual: http_support,
+            });
+        }
+
+        Ok(diffs)
+    }
+
     async fn enable_bios_lockdown(&self) -> Result<(), RedfishError> {
         let lockdown_attrs = hpe::BiosLockdownAttributes {
             //            kcs_enabled: None, // todo: this needs to be set to "false" based on the bmc and bios ver
@@ -623,7 +983,45 @@ impl Bmc {
             .map(|_status_code| ())
     }
 
+    async fn enable_bmc_lockdown2(&self) -> Result<(), RedfishError> {
+        let netlockdown_attrs = hpe::OemHpeLockdownNetworkProtocolAttrs { kcs_enabled: false };
+        let set_netlockdown1 = hpe::OemHpeNetLockdown {
+            hpe: netlockdown_attrs,
+        };
+        let set_netlockdown2 = hpe::SetOemHpeNetLockdown {
+            oem: set_netlockdown1,
+        };
+        let url = format!("Managers/{}/NetworkProtocol", self.s.manager_id());
+        self.s
+            .client
+            .patch(&url, set_netlockdown2)
+            .await
+            .map(|_status_code| ())
+    }
+
+    async fn check_fw_version(&self) -> bool {
+        let ilo_manager = self.get_manager().await;
+        match ilo_manager {
+            Ok(manager) => {
+                let fw_parts: Vec<&str> = manager.firmware_version.split_whitespace().collect();
+                let fw_major: i32 = match fw_parts[1].parse() {
+                    Ok(n) => n,
+                    Err(_) => 0,
+                };
+                let fw_minor: f32 = match (&fw_parts[2][1..]).parse() {
+                    Ok(f) => f,
+                    Err(_) => 0.0,
+                };
+                fw_major >= 6 && fw_minor >= 1.40
+            }
+            Err(_) => false,
+        }
+    }
+
     async fn enable_lockdown(&self) -> Result<(), RedfishError> {
+        if self.check_fw_version().await {
+            self.enable_bmc_lockdown2().await?;
+        }
         self.enable_bios_lockdown().await?;
         self.enable_bmc_lockdown().await
     }
@@ -660,25 +1058,96 @@ impl Bmc {
             .map(|_status_code| ())
     }
 
+    async fn disable_bmc_lockdown2(&self) -> Result<(), RedfishError> {
+        let netlockdown_attrs = hpe::OemHpeLockdownNetworkProtocolAttrs { kcs_enabled: false };
+        let set_netlockdown1 = hpe::OemHpeNetLockdown {
+            hpe: netlockdown_attrs,
+        };
+        let set_netlockdown2 = hpe::SetOemHpeNetLockdown {
+            oem: set_netlockdown1,
+        };
+        let url = format!("Managers/{}/NetworkProtocol", self.s.manager_id());
+        self.s
+            .client
+            .patch(&url, set_netlockdown2)
+            .await
+            .map(|_status_code| ())
+    }
+
     async fn disable_lockdown(&self) -> Result<(), RedfishError> {
+        if self.check_fw_version().await {
+            self.disable_bmc_lockdown2().await?;
+        }
         self.disable_bios_lockdown().await?;
         self.disable_bmc_lockdown().await
     }
 
+    /// Both Intel and AMD have virtualization technologies that help fix the issue of x86 instruction
+    /// architecture not being virtualizable.
+    /// get_enable_virtualization_key returns the KEY for enabling virtualization in the bios attributes
+    /// map that the Lenovo's BMC returns when querying the bios attributes registry. The string returned
+    /// will depend on the processors within the given HPE.
+    async fn get_enable_virtualization_key(
+        &self,
+        bios_attributes: &Value,
+    ) -> Result<&str, RedfishError> {
+        const INTEL_ENABLE_VIRTUALIZATION_KEY: &str = "IntelProcVtd";
+        const AMD_ENABLE_VIRTUALIZATION_KEY: &str = "ProcAmdIoVt";
+
+        // Intel specific
+        if bios_attributes
+            .get(INTEL_ENABLE_VIRTUALIZATION_KEY)
+            .is_some()
+        {
+            Ok(INTEL_ENABLE_VIRTUALIZATION_KEY)
+        // AMD specific
+        } else if bios_attributes.get(AMD_ENABLE_VIRTUALIZATION_KEY).is_some() {
+            Ok(AMD_ENABLE_VIRTUALIZATION_KEY)
+        } else {
+            return Err(RedfishError::MissingKey {
+                key: format!(
+                    "{}/{}",
+                    INTEL_ENABLE_VIRTUALIZATION_KEY, AMD_ENABLE_VIRTUALIZATION_KEY
+                )
+                .to_string(),
+                url: format!("Systems/{}/Bios", self.s.system_id()),
+            });
+        }
+    }
+
     async fn set_virt_enable(&self) -> Result<(), RedfishError> {
-        let virt_attrs = hpe::VirtAttributes {
-            proc_amd_io_vt: Enabled,
-            sriov: Enabled,
+        let bios = self.s.bios_attributes().await?;
+        let mut body = HashMap::new();
+        let enable_virtualization_key = self.get_enable_virtualization_key(&bios).await?;
+        body.insert(
+            "Attributes",
+            HashMap::from([(enable_virtualization_key, "Enabled")]),
+        );
+        let url = format!("Systems/{}/Bios/settings", self.s.system_id());
+        self.s.client.patch(&url, body).await.map(|_status_code| ())
+    }
+
+    async fn get_virt_enabled(&self) -> Result<EnabledDisabled, RedfishError> {
+        let bios = self.s.bios_attributes().await?;
+        let enable_virtualization_key = self.get_enable_virtualization_key(&bios).await?;
+        let Some(val) = bios.get(enable_virtualization_key) else {
+            return Err(RedfishError::MissingKey {
+                key: enable_virtualization_key.to_string(),
+                url: "bios".to_string(),
+            });
         };
-        let set_virt_attrs = hpe::SetVirtAttributes {
-            attributes: virt_attrs,
+        let Some(val) = val.as_str() else {
+            return Err(RedfishError::InvalidKeyType {
+                key: enable_virtualization_key.to_string(),
+                expected_type: "str".to_string(),
+                url: "bios".to_string(),
+            });
         };
-        let url = format!("Systems/{}/Bios/settings/", self.s.system_id());
-        self.s
-            .client
-            .patch(&url, set_virt_attrs)
-            .await
-            .map(|_status_code| ())
+        val.parse().map_err(|_e| RedfishError::InvalidKeyType {
+            key: enable_virtualization_key.to_string(),
+            expected_type: "EnabledDisabled".to_string(),
+            url: "bios".to_string(),
+        })
     }
 
     async fn set_uefi_nic_boot(&self) -> Result<(), RedfishError> {
@@ -695,6 +1164,35 @@ impl Bmc {
             .patch(&url, set_uefi_nic_boot)
             .await
             .map(|_status_code| ())
+    }
+
+    async fn get_uefi_nic_boot(&self) -> Result<(EnabledDisabled, String), RedfishError> {
+        let bios = self.s.bios_attributes().await?;
+
+        let dhcpv4 = bios
+            .get("Dhcpv4")
+            .and_then(|v| v.as_str())
+            .ok_or(RedfishError::MissingKey {
+                key: "Dhcpv4".to_string(),
+                url: "bios".to_string(),
+            })?
+            .parse()
+            .map_err(|_| RedfishError::InvalidKeyType {
+                key: "Dhcpv4".to_string(),
+                expected_type: "EnabledDisabled".to_string(),
+                url: "bios".to_string(),
+            })?;
+
+        let http_support = bios
+            .get("HttpSupport")
+            .and_then(|v| v.as_str())
+            .ok_or(RedfishError::MissingKey {
+                key: "HttpSupport".to_string(),
+                url: "bios".to_string(),
+            })?
+            .to_string();
+
+        Ok((dhcpv4, http_support))
     }
 
     async fn change_boot_order(&self, boot_array: Vec<String>) -> Result<(), RedfishError> {
@@ -813,88 +1311,6 @@ impl Bmc {
         })
     }
 
-    async fn dpu_mac(&self) -> Result<String, RedfishError> {
-        let dpu_serial = self.dpu_serial_number().await?;
-        self.mac_for_serial(&dpu_serial).await
-    }
-
-    /// Find the DPU's serial number
-    async fn dpu_serial_number(&self) -> Result<String, RedfishError> {
-        let pcie_devices = self.pcie_devices().await?;
-        let mut dpu_serial = None;
-        for device in pcie_devices {
-            if device.serial_number.is_none() {
-                // we won't be able to match it to it's NetworkAdapter without the serial
-                continue;
-            }
-            let pcie_functions: ResourceCollection<PCIeFunction> = self
-                .get_collection(device.pcie_functions.unwrap())
-                .await
-                .and_then(|r| r.try_get())?;
-            if pcie_functions.members.iter().any(|p| p.is_dpu()) {
-                // We found it
-                // Safety: serial_number.is_none() check at start of loop
-                dpu_serial = Some(device.serial_number.as_ref().unwrap().trim().to_string());
-                break;
-            }
-        }
-        let Some(dpu_serial) = dpu_serial else {
-            return Err(RedfishError::NoDpu);
-        };
-        Ok(dpu_serial)
-    }
-
-    async fn mac_for_serial(&self, serial_number: &str) -> Result<String, RedfishError> {
-        let chassis = self.get_chassis(self.s.system_id()).await?;
-        let na_id = match chassis.network_adapters {
-            Some(id) => id,
-            None => {
-                return Err(RedfishError::MissingKey {
-                    key: "network_adapters".to_string(),
-                    url: chassis.odata.unwrap().odata_id,
-                })
-            }
-        };
-        let network_adapter: Option<NetworkAdapter> = self
-            .s
-            .get_collection(na_id)
-            .await
-            .and_then(|r| r.try_get::<NetworkAdapter>())?
-            .members
-            .into_iter()
-            .find(|adapter| adapter.serial_number.as_deref() == Some(serial_number));
-        let Some(network_adapter) = network_adapter else {
-            return Err(RedfishError::MissingBootOption(format!(
-                "No NetworkAdapter for PCIeDevice serial {serial_number}"
-            )));
-        };
-
-        let nw_dev_func_oid = match network_adapter.network_device_functions {
-            Some(x) => x,
-            None => {
-                return Err(RedfishError::MissingBootOption(format!(
-                    "NetworkAdapter with serial {serial_number} has no NetworkDeviceFunctions"
-                )));
-            }
-        };
-
-        let device_function: Option<NetworkDeviceFunction> = self
-            .s
-            .get_collection(nw_dev_func_oid)
-            .await
-            .and_then(|r| r.try_get::<NetworkDeviceFunction>())?
-            .members
-            .into_iter()
-            .next();
-        let Some(device_function) = device_function else {
-            return Err(RedfishError::MissingBootOption(format!(
-                "NetworkAdapter with serial {serial_number} has no fetched NetworkDeviceFunctions"
-            )));
-        };
-        device_function.ethernet.and_then(|eth| eth.mac_address).ok_or_else(||
-            RedfishError::MissingBootOption(format!("NetworkDeviceFunction of NetworkAdapter with serial {serial_number} has no Ethernet/MACAddress")))
-    }
-
     /// Set this option as the first one in BootOrder.
     /// boot_ref should look like e.g. "Boot0028"
     async fn set_first_boot(&self, boot_ref: &str) -> Result<(), RedfishError> {
@@ -909,6 +1325,30 @@ impl Bmc {
         let body = HashMap::from([("Boot", HashMap::from([("BootOrder", order)]))]);
         let url = format!("Systems/{}", self.s.system_id());
         self.s.client.patch(&url, body).await.map(|_status_code| ())
+    }
+
+    async fn get_expected_and_actual_first_boot_option(
+        &self,
+        boot_interface_mac: &str,
+    ) -> Result<(Option<String>, Option<String>), RedfishError> {
+        let mac = boot_interface_mac.to_string().to_uppercase();
+
+        let all = self.get_boot_options().await?;
+        let mut expected_first_boot_option = None;
+        for b in all.members {
+            let id = b.odata_id_get()?;
+            let opt = self.get_boot_option(id).await?;
+            let opt_name = opt.display_name.to_uppercase();
+            if opt_name.contains("HTTP") && opt_name.contains("IPV4") && opt_name.contains(&mac) {
+                expected_first_boot_option = Some(opt.boot_option_reference);
+                break;
+            }
+        }
+
+        let order = self.get_system().await?.boot.boot_order;
+        let actual_first_boot_option = order.first().cloned();
+
+        Ok((expected_first_boot_option, actual_first_boot_option))
     }
 
     // move hpe specific code here

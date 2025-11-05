@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -55,7 +55,7 @@ pub struct ServiceRoot {
     pub telemetry_service: Option<ODataId>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Hash, Eq, Serialize, Deserialize)]
 pub enum RedfishVendor {
     Lenovo,
     Dell,
@@ -95,6 +95,7 @@ impl ServiceRoot {
                 Some("GB200 NVL") => RedfishVendor::NvidiaGBx00,
                 _ => RedfishVendor::NvidiaDpu,
             },
+            "wiwynn" => RedfishVendor::NvidiaGBx00,
             "supermicro" => RedfishVendor::Supermicro,
             _ => RedfishVendor::Unknown,
         })

@@ -1,25 +1,4 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: MIT
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -28,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::BiosCommon;
 use crate::model::InvalidValueError;
 use crate::model::OnOff;
+use crate::ODataId;
 use crate::{model::ODataLinks, EnabledDisabled};
 
 serde_with::with_prefix!(prefix_ssh "SSH.1.");
@@ -153,6 +133,7 @@ pub enum BootDevices {
     SD,
     F10,
     F11,
+    UefiHttp,
 }
 
 impl fmt::Display for BootDevices {
@@ -280,6 +261,7 @@ pub struct MachineBiosAttrs {
     pub set_boot_order_en: String,
     #[serde(rename = "HttpDev1TlsMode")]
     pub http_device_1_tls_mode: TlsMode,
+    pub set_boot_order_dis: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -288,6 +270,14 @@ pub struct SetBiosAttrs {
     #[serde(rename = "@Redfish.SettingsApplyTime")]
     pub redfish_settings_apply_time: SetSettingsApplyTime,
     pub attributes: MachineBiosAttrs,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct GenericSetBiosAttrs {
+    #[serde(rename = "@Redfish.SettingsApplyTime")]
+    pub redfish_settings_apply_time: SetSettingsApplyTime,
+    pub attributes: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1329,6 +1319,16 @@ pub struct SystemConfiguration {
     pub shutdown_type: String,
     pub share_parameters: ShareParameters,
     pub import_buffer: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct StorageCollection {
+    #[serde(flatten)]
+    pub odata: ODataLinks,
+    pub description: Option<String>,
+    pub members: Vec<ODataId>,
+    pub name: String,
 }
 
 #[cfg(test)]
